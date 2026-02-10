@@ -27,6 +27,13 @@ def cleanup_ai_output(content: str) -> str:
     
     # 移除开头的空行
     content = content.lstrip('\n')
+
+    # 截取到第一个一级标题 (去除思维链/工具日志)
+    # 查找第一个以 "# " 开头的行
+    match = re.search(r'^#\s+.+', content, flags=re.MULTILINE)
+    if match:
+        # 保留从标题开始的内容
+        content = content[match.start():]
     
     return content
 
