@@ -87,12 +87,16 @@ CALLBACK_AES_KEY=your_aes_key
 # API 配置 (UIUIAPI)
 API_BASE_URL=https://sg.uiuiapi.com/v1
 GEMINI_API_KEY=sk-...
+GEMINI_MODEL=gemini-3-pro-preview-thinking-512
 SONNET_API_KEY=sk-...
+SONNET_MODEL=claude-sonnet-4-5-20250929-thinking
 
 # API 副站配置 (Failover)
 SECONDARY_API_BASE_URL=https://api1.uiuiapi.com/v1
 SECONDARY_GEMINI_API_KEY=sk-...
+SECONDARY_GEMINI_MODEL=gemini-3-pro-preview-thinking
 SECONDARY_SONNET_API_KEY=sk-...
+SECONDARY_SONNET_MODEL=claude-sonnet-4-5-20250929-thinking
 
 # Qwen 配置 (DashScope)
 DASHSCOPE_API_KEY=sk-...
