@@ -51,3 +51,4 @@ output/
 tmp/
 *.pdf
 debug_*.py
+.agent/
