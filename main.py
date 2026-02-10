@@ -229,6 +229,7 @@ async def handle_message(user_id: str, content: str):
                 if content_stripped.lower() in ("开始", "start", "ok", "好"):
                     if pending.timer_task and not pending.timer_task.done():
                         pending.timer_task.cancel()
+                    await send_text_message(user_id, "正在开始处理...")  # Added immediate feedback
                     await _process_task_init(user_id) # 立即触发处理流程 (含查重)
                     return
 
