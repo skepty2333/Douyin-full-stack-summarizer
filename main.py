@@ -172,9 +172,17 @@ async def handle_message(user_id: str, content: str):
                 if content_stripped in ("覆盖", "Overwrite"):
                     if pending.timer_task and not pending.timer_task.done():
                         pending.timer_task.cancel()
-                    await send_text_message(user_id, f"确认覆盖，视频码：{pending.dup_video_code}，开始处理...")
-                    # 覆盖：复用旧的 video_code
-                    await _execute_summary_task(user_id, pending, reuse_video_code=pending.dup_video_code)
+                    
+                    # 覆盖：删除旧记录，生成新记录 (新视频码)
+                    try:
+                        knowledge_db.delete_by_video_code(pending.dup_video_code)
+                        logger.info(f"覆盖操作: 已删除旧记录 {pending.dup_video_code}")
+                    except Exception as e:
+                        logger.error(f"覆盖删除失败: {e}")
+
+                    new_code = generate_video_code()
+                    await send_text_message(user_id, f"确认覆盖，视频码：{new_code}，开始处理...")
+                    await _execute_summary_task(user_id, pending, reuse_video_code=new_code)
                     
                 elif content_stripped in ("新增", "New"):
                     if pending.timer_task and not pending.timer_task.done():
@@ -182,7 +190,7 @@ async def handle_message(user_id: str, content: str):
                     new_code = generate_video_code()
                     await send_text_message(user_id, f"确认新增，视频码：{new_code}，开始处理...")
                     # 新增：使用新的 video_code
-                    await _execute_summary_task(user_id, pending, reuse_video_code=None)
+                    await _execute_summary_task(user_id, pending, reuse_video_code=new_code)
                     
                 elif content_stripped in ("取消", "Cancel"):
                     if pending.timer_task and not pending.timer_task.done():

@@ -265,6 +265,16 @@ class KnowledgeStore:
         finally:
             conn.close()
 
+    def delete_by_video_code(self, video_code: str) -> bool:
+        """通过视频码删除记录"""
+        conn = self._get_conn()
+        try:
+            cursor = conn.execute("DELETE FROM knowledge WHERE video_code = ?", (video_code,))
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
     def stats(self) -> dict:
         """数据库统计"""
         conn = self._get_conn()
