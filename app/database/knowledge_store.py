@@ -1,9 +1,4 @@
-"""
-知识库存储模块
-
-使用 SQLite + FTS5 全文搜索存储视频总结笔记。
-提供存储、搜索、检索等功能，供 Bot 主流程和 MCP Server 共用。
-"""
+"""知识库存储模块 (SQLite + FTS5)"""
 import os
 import json
 import sqlite3
@@ -12,11 +7,9 @@ import re
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from typing import Optional, List
+from app.config import KNOWLEDGE_DB_PATH
 
 logger = logging.getLogger(__name__)
-
-# 默认数据库路径 (持久化, 不放 /tmp)
-DEFAULT_DB_PATH = os.getenv("KNOWLEDGE_DB_PATH", "/home/admin/douyin-bot/knowledge.db")
 
 
 @dataclass
@@ -38,7 +31,7 @@ class KnowledgeEntry:
 class KnowledgeStore:
     """知识库管理器"""
 
-    def __init__(self, db_path: str = DEFAULT_DB_PATH):
+    def __init__(self, db_path: str = KNOWLEDGE_DB_PATH):
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._init_db()
@@ -101,23 +94,21 @@ class KnowledgeStore:
             
             # Migration: Add video_code column if not exists
             try:
-                # Check if column exists
                 cursor = conn.execute("PRAGMA table_info(knowledge)")
                 columns = [input_row[1] for input_row in cursor.fetchall()]
                 if "video_code" not in columns:
-                    logger.info("Applying migration: Add video_code column")
                     conn.execute("ALTER TABLE knowledge ADD COLUMN video_code TEXT")
                     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_video_code ON knowledge(video_code)")
                     conn.commit()
-            except Exception as e:
-                logger.warning(f"Migration failed: {e}")
+            except Exception:
+                pass
 
             logger.info(f"知识库初始化完成: {self.db_path}")
         finally:
             conn.close()
 
     def save(self, entry: KnowledgeEntry) -> int:
-        """保存一条知识记录, 返回 id"""
+        """保存知识记录"""
         if not entry.created_at:
             entry.created_at = datetime.now(timezone.utc).isoformat()
 
@@ -141,7 +132,6 @@ class KnowledgeStore:
                     entry.video_id, entry.title, entry.author,
                     entry.source_url, entry.summary_markdown,
                     entry.tags, entry.user_requirement,
-                    entry.tags, entry.user_requirement,
                     entry.created_at, entry.duration_seconds,
                     entry.video_code
                 ),
@@ -154,11 +144,7 @@ class KnowledgeStore:
             conn.close()
 
     def search(self, query: str, limit: int = 10) -> List[dict]:
-        """
-        全文搜索知识库
-
-        返回匹配记录的列表 (不含完整 markdown, 只含摘要)
-        """
+        """全文搜索 (尝试 FTS5, 失败回退到 LIKE)"""
         conn = self._get_conn()
         try:
             # FTS5 搜索
@@ -173,10 +159,8 @@ class KnowledgeStore:
                    LIMIT ?""",
                 (query, limit),
             ).fetchall()
-
             return [dict(r) for r in rows]
-        except Exception as e:
-            logger.warning(f"FTS 搜索失败 ({e}), 回退 LIKE 搜索")
+        except Exception:
             # 回退到 LIKE
             like = f"%{query}%"
             rows = conn.execute(
@@ -195,12 +179,10 @@ class KnowledgeStore:
             conn.close()
 
     def get_by_id(self, entry_id: int) -> Optional[dict]:
-        """通过 ID 获取完整记录 (含完整 markdown)"""
+        """通过 ID 获取完整记录"""
         conn = self._get_conn()
         try:
-            row = conn.execute(
-                "SELECT * FROM knowledge WHERE id = ?", (entry_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM knowledge WHERE id = ?", (entry_id,)).fetchone()
             return dict(row) if row else None
         finally:
             conn.close()
@@ -209,9 +191,7 @@ class KnowledgeStore:
         """通过视频ID获取"""
         conn = self._get_conn()
         try:
-            row = conn.execute(
-                "SELECT * FROM knowledge WHERE video_id = ?", (video_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM knowledge WHERE video_id = ?", (video_id,)).fetchone()
             return dict(row) if row else None
         finally:
             conn.close()
@@ -220,9 +200,7 @@ class KnowledgeStore:
         """通过视频码获取"""
         conn = self._get_conn()
         try:
-            row = conn.execute(
-                "SELECT * FROM knowledge WHERE video_code = ?", (video_code,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM knowledge WHERE video_code = ?", (video_code,)).fetchone()
             return dict(row) if row else None
         finally:
             conn.close()
@@ -274,9 +252,7 @@ class KnowledgeStore:
         """数据库统计"""
         conn = self._get_conn()
         try:
-            row = conn.execute(
-                "SELECT COUNT(*) as total, MAX(created_at) as latest FROM knowledge"
-            ).fetchone()
+            row = conn.execute("SELECT COUNT(*) as total, MAX(created_at) as latest FROM knowledge").fetchone()
             return {
                 "total_entries": row["total"],
                 "latest_entry": row["latest"],
@@ -287,10 +263,7 @@ class KnowledgeStore:
 
 
 def extract_tags_from_markdown(markdown: str) -> str:
-    """
-    从 Markdown 总结中自动提取标签
-    提取所有 **加粗** 的关键词作为标签候选
-    """
+    """从 Markdown 中提取加粗的关键词作为标签"""
     bold_terms = re.findall(r'\*\*([^*]+)\*\*', markdown)
     # 取前15个, 去重, 去过短的
     seen = set()
