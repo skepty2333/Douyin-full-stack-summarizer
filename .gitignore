@@ -50,5 +50,6 @@ douyin-bot/
 output/
 tmp/
 *.pdf
+*.rpm
 debug_*.py
 .agent/
