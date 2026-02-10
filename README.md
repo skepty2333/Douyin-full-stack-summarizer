@@ -4,7 +4,7 @@
 
 ## 核心特性
 
-- **三阶段 AI 管线**：Gemini 转写 → DeepSeek 深度审视 → Sonnet 联网搜索增强
+- **三阶段 AI 管线**：Gemini 转写 → Qwen 深度审视 (联网) → Sonnet 整合增强
 - **轻量级解析**：HTTP 请求模拟移动端，无需重型浏览器
 - **PDF 输出**：WeasyPrint + Matplotlib 公式渲染，GitHub 风格排版，支持 LaTeX
 - **交互式对话**：2分钟窗口期可追加自定义总结要求
