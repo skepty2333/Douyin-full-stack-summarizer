@@ -244,6 +244,9 @@ def _fix_colon_then_list(line: str) -> str:
 
 def _fix_marker_spacing(line: str) -> str:
     """修复列表标记缺空格"""
+    # 如果是 **bold** 或其他连续符号，视为强调/分割线而非列表
+    if re.match(r'^[*]{2,}', line): return line
+
     if re.match(r'^[*\-+][^\s]', line): return line[0] + ' ' + line[1:]
     return line
 
@@ -345,6 +348,7 @@ p { margin-bottom: 16px; }
 blockquote { color: #656d76; border-left: 0.25em solid #d1d9e0; padding: 0 1em; }
 code { background-color: rgba(175, 184, 193, 0.2); padding: 0.2em 0.4em; border-radius: 6px; font-family: monospace; }
 pre { background-color: #f6f8fa; padding: 16px; overflow: auto; border-radius: 6px; }
+pre code { background-color: transparent; padding: 0; border-radius: 0; }
 table { border-collapse: collapse; margin-bottom: 16px; width: 100%; }
 th, td { padding: 6px 13px; border: 1px solid #d1d9e0; }
 tr:nth-child(2n) { background-color: #f6f8fa; }

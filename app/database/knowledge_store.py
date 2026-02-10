@@ -44,14 +44,13 @@ class KnowledgeStore:
         return conn
 
     def _init_db(self):
-        """初始化表结构和全文索引 (强制重置以支持 Schema 变更)"""
+        """初始化表结构和全文索引 (非破坏性: 仅在不存在时创建)"""
         conn = self._get_conn()
         try:
-            # 强制重置
+            # 使用 IF NOT EXISTS 避免覆盖现有数据
+            # 触发器采用先删后建策略，确保逻辑更新
             conn.executescript("""
-                DROP TABLE IF EXISTS knowledge;
-                DROP TABLE IF EXISTS knowledge_fts;
-                CREATE TABLE knowledge (
+                CREATE TABLE IF NOT EXISTS knowledge (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     video_id TEXT NOT NULL,         -- 不再唯一，允许同一视频多条记录
                     title TEXT NOT NULL DEFAULT '',
@@ -67,7 +66,7 @@ class KnowledgeStore:
                 );
 
                 -- FTS5 全文搜索虚拟表 (中文分词用 unicode61)
-                CREATE VIRTUAL TABLE knowledge_fts USING fts5(
+                CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
                     title,
                     author,
                     summary_markdown,
@@ -77,17 +76,20 @@ class KnowledgeStore:
                     tokenize='unicode61'
                 );
 
-                -- 自动同步触发器
+                -- 自动同步触发器 (重建以防逻辑变更)
+                DROP TRIGGER IF EXISTS knowledge_ai;
                 CREATE TRIGGER knowledge_ai AFTER INSERT ON knowledge BEGIN
                     INSERT INTO knowledge_fts(rowid, title, author, summary_markdown, tags)
                     VALUES (new.id, new.title, new.author, new.summary_markdown, new.tags);
                 END;
 
+                DROP TRIGGER IF EXISTS knowledge_ad;
                 CREATE TRIGGER knowledge_ad AFTER DELETE ON knowledge BEGIN
                     INSERT INTO knowledge_fts(knowledge_fts, rowid, title, author, summary_markdown, tags)
                     VALUES ('delete', old.id, old.title, old.author, old.summary_markdown, old.tags);
                 END;
 
+                DROP TRIGGER IF EXISTS knowledge_au;
                 CREATE TRIGGER knowledge_au AFTER UPDATE ON knowledge BEGIN
                     INSERT INTO knowledge_fts(knowledge_fts, rowid, title, author, summary_markdown, tags)
                     VALUES ('delete', old.id, old.title, old.author, old.summary_markdown, old.tags);
@@ -96,7 +98,7 @@ class KnowledgeStore:
                 END;
             """)
             conn.commit()
-            logger.info(f"知识库初始化完成 (重置): {self.db_path}")
+            logger.info(f"知识库初始化完成 (持久化模式): {self.db_path}")
         finally:
             conn.close()
 
