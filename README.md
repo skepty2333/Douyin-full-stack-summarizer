@@ -47,22 +47,17 @@
 
 ```mermaid
 graph TD
-    User["用户 (企业微信)"] -->|1. 分享链接| Server["Bot 主服务"]
+    User["用户 (企业微信)"] -->|1. 分享链接| Server["Bot主服务"]
     User -->|2. 补充要求| Server
+    Server -->|3. 解析/下载| Parser["抖音轻量解析器"]
+    Server -->|4. AI总结| AI["三阶段AI管线\n(Gemini -> Qwen -> Sonnet)"]
+    AI -->|5. 生成PDF| PDF["PDF生成器"]
+    AI -->|6. 存入SQLite| DB[("知识库 Knowledge.db")]
     
-    subgraph "核心处理流"
-        Server -->|3. 解析/下载| Parser["抖音轻量解析器"]
-        Parser -->|4. 音频提取| Audio["ffmpeg"]
-        
-        Audio -->|5. Stage 1| Gemini["Gemini (听录)"]
-        Gemini -->|6. Stage 2| Qwen["Qwen (联网研究)"]
-        Qwen -->|7. Stage 3| Sonnet["Sonnet (整合写作)"]
-    end
+    Claude["Claude.ai"] <-->|MCP Protocol| MCPServer["MCP Server :8090"]
+    MCPServer <-->|Query| DB
     
-    Sonnet -->|8. 生成| PDF["PDF 渲染器"]
-    Sonnet -->|9. 存储| DB[("SQLite 知识库")]
-    
-    Server -->|10. 推送文件| User
+    Server -->|7. 推送文件| User
 ```
 
 ---
