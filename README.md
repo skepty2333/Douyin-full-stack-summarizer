@@ -1,168 +1,157 @@
-# 🎬 抖音视频知识总结 Bot
+# 🎬 抖音视频知识总结 Bot (Douyin Video Summarizer)
 
-企业微信中发送抖音链接 → AI 三阶段管线自动生成结构化学习笔记 PDF。
+![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg)
+![WeChat](https://img.shields.io/badge/WeChat-Work-orange.svg)
+![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)
 
-## 核心特性
+**将抖音/TikTok 视频转化为结构化的深度学习笔记。**
 
-- **三阶段 AI 管线**：Gemini 转写 → Qwen 深度审视 (联网) → Sonnet 整合增强
-- **轻量级解析**：HTTP 请求模拟移动端，无需重型浏览器
-- **PDF 输出**：WeasyPrint + Matplotlib 公式渲染，GitHub 风格排版，支持 LaTeX
-- **交互式对话**：2分钟窗口期可追加自定义总结要求
-- **知识库 & MCP**：内置 SQLite 向量/全文检索，支持 Claude.ai 联网调用知识库 (Streamable HTTP)
+这是一个运行在企业微信上的智能 Bot。发送抖音视频链接，它将自动通过 **三阶段 AI 管线**（听录 -> 深度研究 -> 总结），生成一份包含核心观点、事实核查和背景知识的精美 PDF 报告。
 
-## 架构
+---
+
+## ✨ 核心特性
+
+### 🚀 智能交互
+- **即时响应**：发送视频链接后，Bot 会立即准备就绪。
+- **自定义要求**：
+    - **自动开始**：发送链接后，直接发送你的具体要求（如“提取由于...的原因”、“总结为表格”），Bot 会**自动确认并立即开始**。
+    - **多条追加**：支持连续发送多条要求，Bot 会自动合并。
+- **静默处理**：无需繁琐的确认指令，一切按你所想自动运行。
+
+### 🧠 三阶段 AI 深度管线
+本项目采用先进的 "Chain of Thought" 设计：
+1.  **Stage 1: 全文听录 (Gemini 1.5/3 Pro)**
+    - 多模态/Whisper 识别视频中的所有语音内容，生成逐字稿。
+    - *支持自动故障切换 (Failover)*：主线路繁忙时自动切换备用 API。
+2.  **Stage 2: 深度审视 & 联网 (Qwen-Max)**
+    - **联网搜索**：不仅仅是总结，还会对视频内容进行**事实核查**。
+    - **知识审计**：发现视频中的逻辑漏洞，补充缺失的背景概念。
+    - **全网搜索详情**：保留详细的搜索来源和数据支撑，拒绝空洞。
+3.  **Stage 3: 终稿生成 (Claude 3.5 Sonnet)**
+    - 结合初稿与研究报告，由最强的逻辑模型生成最终的结构化笔记。
+    - 支持复杂的 Markdown 排版和 LaTeX 公式（自动转图片渲染）。
+
+### 📄 专业级输出
+- **精美 PDF**：基于 HTML+CSS (WeasyPrint) 渲染，像 GitHub Readme 一样美观。
+- **知识库沉淀**：
+    - 所有历史记录存入 SQLite 数据库。
+    - 支持 **FTS5 全文检索**。
+- **MCP 协议支持**：
+    - 内置 MCP Server，支持通过 **Claude Desktop** 或 **Cursor** 远程调用你的私人视频知识库。
+    - 问 Claude："帮我找一下之前看过的关于‘量子力学’的视频笔记"，即刻检索。
+
+---
+
+## 🛠️ 架构图
 
 ```mermaid
 graph TD
-    User["用户 (企业微信)"] -->|1. 抖音链接| Server["Bot主服务"]
-    Server -->|2. 解析/下载| Parser["抖音解析器"]
-    Server -->|3. AI总结| AI["三阶段AI管线"]
-    AI -->|4. 生成PDF| PDF["PDF生成器"]
-    AI -->|5. 存入SQLite| DB[("知识库 Knowledge.db")]
+    User["用户 (企业微信)"] -->|1. 分享链接| Server["Bot 主服务"]
+    User -->|2. (可选) 补充要求| Server
     
-    Claude["Claude.ai"] <-->|MCP Protocol| MCPServer["MCP Server :8090"]
-    MCPServer <-->|Query| DB
+    subgraph "核心处理流"
+        Server -->|3. 解析/下载| Parser["抖音轻量解析器"]
+        Parser -->|4. 音频提取| Audio["ffmpeg"]
+        
+        Audio -->|5. Stage 1| Gemini["Gemini (听录)"]
+        Gemini -->|6. Stage 2| Qwen["Qwen (联网研究)"]
+        Qwen -->|7. Stage 3| Sonnet["Sonnet (整合写作)"]
+    end
     
-    Server -->|6. 返回PDF| User
+    Sonnet -->|8. 生成| PDF["PDF 渲染器"]
+    Sonnet -->|9. 存储| DB[("SQLite 知识库")]
+    
+    Server -->|10. 推送文件| User
 ```
 
-## 文件结构
+---
 
-```
-douyin-bot/
-├── app/                     # 核心代码
-│   ├── config.py            # 统一配置
-│   ├── services/            # 业务逻辑 (AI, 解析, PDF, 微信)
-│   ├── database/            # 数据存储 (SQLite/FTS5)
-│   └── utils/               # 工具函数
-├── deployment/              # 部署文件 (service, nginx)
-├── scripts/                 # 脚本 (setup.sh)
-├── main.py                  # Bot 入口
-├── mcp_server.py            # MCP Server 入口
-└── knowledge.db             # 知识库文件 (自动生成)
-```
+## � 快速部署
 
-## 🛠️ 技术选型
+### 环境要求
+- Python 3.10+
+- FFmpeg (必须)
+- 中文字体 (用于 PDF 渲染, 推荐 Noto Sans CJK)
+- 公网 IP 服务器 (用于接收企业微信回调)
 
-- **Web 框架**: FastAPI (Python 3.11)
-- **企业微信 SDK**: `WeChatCrypto` (回调加解密)
-- **音频处理**: `yt-dlp` (下载), `ffmpeg` (转换/切片)
-- **AI 模型**:
-    - **Stage 1 (听录)**: Google Gemini 3 Pro Preview (via UIUIAPI, 支持自动故障切换)
-    - **Stage 2 (研究)**: Alibaba Qwen-Max (via Aliyun DashScope, 支持联网搜索)
-    - **Stage 3 (总结)**: Claude 4.5 Sonnet (Thinking) (via UIUIAPI, 支持自动故障切换)
-- **PDF 生成**: `markdown` + `WeasyPrint` (CSS排版, LaTeX支持)
-- **数据存储**: SQLite + JSON (简单高效)
-- **任务队列**: `asyncio` 原生协程 (轻量级并发)
-
-## 部署
-
-### 1. 上传项目
+### 1. 克隆与安装
 
 ```bash
-scp -r douyin-bot root@服务器IP:~/
-ssh root@服务器IP
-cd ~/douyin-bot
-```
-
-### 2. 一键部署
-
-```bash
+git clone https://github.com/skepty2333/Douyin-full-stack-summarizer.git
+cd douyin-bot
 chmod +x scripts/setup.sh && ./scripts/setup.sh
 ```
-自动安装：Python3、ffmpeg、系统依赖、中文字体、Python 包。
 
-### 3. 配置环境变量
+### 2. 配置环境变量
 
-复制 `.env.example` (参考下文) 到 `.env` 并填入配置：
+复制 `.env.example` 为 `.env`：
 
 ```bash
-# 企业微信配置
-CORP_ID=your_corp_id
-AGENT_ID=1000002
-CORP_SECRET=your_secret
-CALLBACK_TOKEN=your_token
-CALLBACK_AES_KEY=your_aes_key
-
-# API 配置 (UIUIAPI)
-API_BASE_URL=https://sg.uiuiapi.com/v1
-GEMINI_API_KEY=sk-...
-GEMINI_MODEL=gemini-3-pro-preview-thinking-512
-SONNET_API_KEY=sk-...
-SONNET_MODEL=claude-sonnet-4-5-20250929-thinking
-
-# API 副站配置 (Failover)
-SECONDARY_API_BASE_URL=https://api1.uiuiapi.com/v1
-SECONDARY_GEMINI_API_KEY=sk-...
-SECONDARY_GEMINI_MODEL=gemini-3-pro-preview-thinking
-SECONDARY_SONNET_API_KEY=sk-...
-SECONDARY_SONNET_MODEL=claude-sonnet-4-5-20250929-thinking
-
-# Qwen 配置 (DashScope)
-DASHSCOPE_API_KEY=sk-...
-QWEN_MODEL=qwen-max
+cp .env.example .env
+vim .env
 ```
 
-### 4. 启动服务
+| 变量类 | 变量名 | 说明 |
+| :--- | :--- | :--- |
+| **企业微信** | `CORP_ID` | 企业 ID |
+| | `AGENT_ID` | 应用 AgentId |
+| | `CORP_SECRET` | 应用 Secret |
+| | `CALLBACK_TOKEN` | 回调 Token |
+| | `CALLBACK_AES_KEY` | 回调 EncodingAESKey |
+| **主 AI 模型** | `API_BASE_URL` | UIUIAPI 或 OpenAI 兼容地址 |
+| | `GEMINI_API_KEY` | Stage 1 Key |
+| | `SONNET_API_KEY` | Stage 3 Key |
+| **副 AI 模型** | `SECONDARY_...` | (可选) 备用线路配置，用于故障切换 |
+| **深度研究** | `DASHSCOPE_API_KEY` | 阿里云 DashScope Key (用于 Qwen) |
+
+### 3. 启动服务
 
 ```bash
-# 1. 启动 Bot 服务
+# 启动主服务
 sudo systemctl start douyin-bot
-sudo systemctl enable douyin-bot
 
-# 2. 启动 Knowledge MCP Server (依赖 Python 3.10+)
-sudo systemctl start douyin-mcp
-sudo systemctl enable douyin-mcp
-
-# 开放端口
-sudo firewall-cmd --add-port=8080/tcp --permanent
-sudo firewall-cmd --add-port=8090/tcp --permanent
-sudo firewall-cmd --reload
-```
-
-### 5. 企业微信配置
-
-1. 登录 [企业微信管理后台](https://work.weixin.qq.com)
-2. **应用管理 → 自建 → 创建应用**
-3. 设置 API 接收消息 URL: `http://你的IP:8080/wechat/callback`
-4. 确保应用可见范围包含你自己
-
-### 6. 连接 Claude (MCP)
-
-本项目使用 **Streamable HTTP** 协议 (SSE)。需要通过 Cloudflare Tunnel 将本地 8090 端口暴露为 HTTPS。
-
-1. **启动 Tunnel**:
-   ```bash
-   cloudflared tunnel --url http://localhost:8090
-   ```
-   复制终端输出的 URL (例如 `https://xyz.trycloudflare.com`)。
-
-2. **配置 Claude**:
-   - 打开 Claude.ai → Settings → Developer → Edit MCP Servers
-   - 添加新的 MCP Server:
-     - Name: `Douyin Knowledge`
-     - Type: `sse`
-     - URL: `https://xyz.trycloudflare.com/mcp`
-
-3. **使用**:
-   在 Claude 对话中输入 "Search for video about [topic]" 即可调用知识库。
-
-## 服务管理
-
-```bash
-# Bot 服务
-sudo systemctl status douyin-bot
+# 查看日志
 journalctl -u douyin-bot -f
-
-# MCP 服务
-sudo systemctl status douyin-mcp
-journalctl -u douyin-mcp -f
 ```
 
-## 常见问题
+---
 
-| 问题 | 解决方案 |
-|------|----------|
-| 视频解析失败 | 检查网络，部分地区 IP 可能被抖音屏蔽 |
-| PDF 中文乱码 | 确认已安装 `google-noto-sans-cjk-ttc-fonts` (脚本自动安装) |
-| MCP 连接失败 | 确认 Cloudflare Tunnel 正常运行，且 Claude 配置为 Streamable HTTP (SSE) |
+## 📖 使用指南
+
+### 基础用法
+1. 在抖音 APP 中点击分享 -> **复制链接**。
+2. 在企业微信中发送给 Bot。
+3. Bot 回复“收到...”。
+4. **如果无需额外要求**：发送“**开始**”或等待 2 分钟，Bot 自动运行。
+5. **如果有要求**：直接发送“**总结一下其中的商业模式**”。
+    - Bot 会回复“已收到补充要求，正在开始处理...”。
+    - 随后自动开始，无需再发指令。
+
+### 高级用法 (MCP)
+如果你使用 Claude.ai 或 Cursor：
+1. 启动 `mcp_server.py` (通常由 systemd 管理)。
+2. 使用 `cloudflared` 将 8090 端口暴露为 HTTPS。
+3. 在 Claude 中配置 MCP Server URL。
+4. 对话示例：
+   > "查询我的知识库，最近有没有关于‘AI 编程’的视频？"
+
+---
+
+## 🔧 常见问题 (FAQ)
+
+**Q: 为什么 PDF 中的中文是乱码？**
+A: 服务器缺少中文字体。`setup.sh` 脚本会自动尝试安装 `google-noto-sans-cjk-ttc-fonts`。如果失败，请手动安装字体并刷新缓存 (`fc-cache -fv`)。
+
+**Q: 解析失败或下载慢？**
+A: 抖音对数据中心 IP 有反爬策略。建议使用家庭宽带 IP 或尝试更替服务器 IP。
+
+**Q: 备用线路是什么？**
+A: 系统内置了高可用逻辑。当主 API (如 UIUIAPI) 返回 429 或 5xx 错误时，系统会自动尝试 `SECONDARY_` 配置的 API Key，确保服务稳定性。
+
+---
+
+## 📜 许可证
+
+MIT License
