@@ -1,4 +1,4 @@
-# 🎬 抖音视频知识总结 Bot (Douyin Video Summarizer)
+# 抖音全栈视频知识总结Bot (Douyin Full-Stack Video Summarizer)
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg)
