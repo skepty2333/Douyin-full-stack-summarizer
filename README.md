@@ -9,7 +9,7 @@
 
 这是一个运行在企业微信上的智能 Bot。发送抖音视频链接，它将自动通过 **三阶段 AI 管线**（听录 -> 深度研究 -> 总结），生成一份包含核心观点、事实核查和背景知识的精美 PDF 报告。
 
-此外，它会自动将所有历史笔记沉淀为 **SQLite 向量知识库**，并内置 **MCP Server**，支持通过 Claude Desktop 或 Cursor 远程调用，让你随时与自己的视频知识库对话。
+此外，它会自动将所有历史笔记沉淀为 **SQLite 向量知识库**，并内置 **MCP Server**，支持通过 Claude Connector (Web) / Desktop 或 Cursor 远程调用，让你随时与自己的视频知识库对话。
 
 ---
 
@@ -40,7 +40,7 @@
     - 所有历史记录存入 SQLite 数据库。
     - 支持 **FTS5 全文检索**。
 - **MCP 协议支持**：
-    - 内置 MCP Server，支持通过 **Claude Desktop** 或 **Cursor** 远程调用你的私人视频知识库。
+    - 内置 MCP Server，支持通过 **Claude Connector (Web) / Desktop** 或 **Cursor** 远程调用你的私人视频知识库。
     - 问 Claude："帮我找一下之前看过的关于‘量子力学’的视频笔记"，即刻检索。
 
 ---
