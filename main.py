@@ -229,19 +229,22 @@ async def handle_message(user_id: str, content: str):
                 if content_stripped.lower() in ("开始", "start", "ok", "好"):
                     if pending.timer_task and not pending.timer_task.done():
                         pending.timer_task.cancel()
-                    await send_text_message(user_id, "正在开始处理...")  # Added immediate feedback
+                    
+                    await send_text_message(user_id, "正在开始处理...")
                     await _process_task_init(user_id) # 立即触发处理流程 (含查重)
                     return
 
                 # 补充要求
+                # 补充要求 -> 自动开始
+                # 用户只需发送要求，即可触发开始，无需再发“开始”
+                if pending.timer_task and not pending.timer_task.done():
+                    pending.timer_task.cancel()
+
                 pending.extra_requirement = content_stripped
-                logger.info(f"📝 {user_id} 补充: {content[:30]}")
-                # 重新计时? 用户说 "等待两分钟"，通常是指从第一条消息开始。
-                # 但如果在最后一秒补充了要求，是否应该延时？
-                # "2分钟内可补充..."，所以这里保持原定时器，不重置，除非为了更好体验。
-                # 简单起见，不重置定时器，只更新要求。
-                # 但如果用户希望确认收到，可以回个简单的确认？
-                # 用户没要求回确认，只说 "回复前两个要求..." 是指最终回复。
+                logger.info(f"📝 {user_id} 补充并开始: {content[:30]}")
+                
+                await send_text_message(user_id, "已收到补充要求，正在开始处理...")
+                await _process_task_init(user_id)
                 return
 
         # 情况2: 新链接

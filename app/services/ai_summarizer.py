@@ -145,8 +145,8 @@ STAGE2_SYSTEM = """你是一位博学严谨的知识审计与深度研究专家�
 ## 3. 深度研判与扩展
 - ...
 
-## 4. 原始搜索摘要
-(列出搜索到的关键信息摘要)
+## 4. 全网搜索详情
+(请详尽列出搜索到的所有有价值信息、数据来源和相关细节，保留丰富的信息量，不要过度摘要)
 """
 
 STAGE3_SYSTEM = """你是一位顶级知识编辑。请将初稿和《深度研究报告》整合成一份完整、深入、样式精美的最终版笔记。
@@ -309,16 +309,16 @@ async def summarize_with_audio(audio_path, video_title="", video_author="", user
     async def notify(msg):
         if progress_callback: await progress_callback(msg)
 
-    await notify("🔬 [1/3] Gemini 转写生成初稿...")
+    # await notify("🔬 [1/3] Gemini 转写生成初稿...")
     draft = await stage1_transcribe_and_draft(audio_path, video_title, video_author, user_requirement, callback=notify)
     
-    await notify("🧠 [2/3] Qwen 深度思考与联网研究...")
+    # await notify("🧠 [2/3] Qwen 深度思考与联网研究...")
     research_report = await stage2_deep_research(draft)
     
-    await notify("✍️ [3/3] Sonnet 整合生成终稿...")
+    # await notify("✍️ [3/3] Sonnet 整合生成终稿...")
     final = await stage3_enrich_and_finalize(draft, research_report, video_author, user_requirement, callback=notify)
     
-    await notify("✅ 处理完成")
+    # await notify("✅ 处理完成")
     return final
 
 
