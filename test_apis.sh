@@ -4,11 +4,11 @@ echo "API 连通性测试"
 echo "=============================="
 
 echo ""
-echo "--- 1. 主站 Gemini (gemini-3.1-pro-preview) ---"
+echo "--- 1. 主站 Gemini (gemini-3.1-pro-preview-thinking) ---"
 RESP=$(curl -s --connect-timeout 15 --max-time 60 https://sg.uiuiapi.com/v1/chat/completions \
   -H "Authorization: Bearer sk-6W2nsjT59X2Oy1foej3kCGolfJpVxW2iBnIpCB5NfMxDJ1m2" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3.1-pro-preview","messages":[{"role":"user","content":"reply OK"}],"max_tokens":5}')
+  -d '{"model":"gemini-3.1-pro-preview-thinking","messages":[{"role":"user","content":"reply OK"}],"max_tokens":5}')
 echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('  ✅', d['choices'][0]['message']['content']) if 'choices' in d else print('  ❌', d.get('error',{}).get('message', d))"
 
 echo ""

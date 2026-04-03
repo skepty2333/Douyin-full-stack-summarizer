@@ -22,7 +22,7 @@ SECONDARY_SONNET_MODEL = os.getenv("SECONDARY_SONNET_MODEL", "claude-sonnet-4-6-
 
 # 阶段1: Gemini - 初始转写+总结
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your_gemini_api_key")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-pro-preview-thinking-512")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview-thinking")
 
 # 阶段2: Qwen (DashScope) - 深度思考与联网搜索
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "your_dashscope_api_key")
