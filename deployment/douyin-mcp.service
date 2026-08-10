@@ -1,6 +1,9 @@
 [Unit]
 Description=Douyin Knowledge MCP Server
-After=network.target
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -8,11 +11,30 @@ User=root
 Group=root
 WorkingDirectory=/root/douyin-bot
 EnvironmentFile=/root/douyin-bot/.env
-Environment=KNOWLEDGE_DB_PATH=/root/douyin-bot/knowledge.db
-Environment=MCP_PORT=8090
-ExecStart=/usr/bin/python3.11 mcp_server.py
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/root/douyin-bot/venv/bin/python mcp_server.py
 Restart=always
 RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/root/douyin-bot
+ReadOnlyPaths=/root/douyin-bot/.env /root/douyin-bot/app /root/douyin-bot/deployment /root/douyin-bot/scripts /root/douyin-bot/tests /root/douyin-bot/venv /root/douyin-bot/main.py /root/douyin-bot/mcp_server.py /root/douyin-bot/requirements.txt
+CapabilityBoundingSet=
+LimitNOFILE=4096
+TasksMax=128
+MemoryMax=512M
 StandardOutput=journal
 StandardError=journal
 

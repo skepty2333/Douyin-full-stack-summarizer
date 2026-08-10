@@ -33,6 +33,9 @@ venv/
 # Database
 *.db
 *.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
 
 # Logs
 *.log
@@ -46,6 +49,7 @@ venv/
 
 # Project specific
 knowledge.db
+knowledge_assets/
 douyin-bot/
 output/
 tmp/
@@ -53,3 +57,5 @@ tmp/
 *.rpm
 debug_*.py
 .agent/
+/backups/
+whisper_failures.txt

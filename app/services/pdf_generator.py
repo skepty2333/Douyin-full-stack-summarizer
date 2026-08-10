@@ -7,12 +7,37 @@ PDF 生成模块
 import logging
 import re
 import base64
+import html
 import io
 import os
 import tempfile
 import gc
+import threading
 
 logger = logging.getLogger(__name__)
+logging.getLogger("fontTools").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+MAX_EMBEDDED_IMAGE_URL_BYTES = 5 * 1024 * 1024
+BLOCK_FORMULA_FONTSIZE = 17
+INLINE_FORMULA_FONTSIZE = 13
+_LATEX_RENDER_LOCK = threading.Lock()
+
+
+def _safe_pdf_url_fetcher(url: str):
+    """Allow only bounded in-memory formula PNGs and reviewed video JPEGs."""
+    if not url.startswith(
+        (
+            "data:image/png;base64,",
+            "data:image/jpeg;base64,",
+            "data:image/svg+xml;base64,",
+        )
+    ):
+        raise ValueError("PDF 禁止读取外部 URL 或本地文件")
+    if len(url.encode("ascii", errors="ignore")) > MAX_EMBEDDED_IMAGE_URL_BYTES:
+        raise ValueError("PDF 内嵌图片超过安全上限")
+    from weasyprint import default_url_fetcher
+
+    return default_url_fetcher(url)
 
 
 # ======================== Cleanup ========================
@@ -40,46 +65,69 @@ def cleanup_ai_output(content: str) -> str:
 
 # ======================== LaTeX Renderer ========================
 
-def render_latex_to_base64(latex_code: str, fontsize: int = 12, dpi: int = 72) -> str:
-    """使用 matplotlib 将 LaTeX 公式渲染为 base64 PNG"""
+def render_latex_to_base64(
+    latex_code: str,
+    fontsize: int = BLOCK_FORMULA_FONTSIZE,
+    dpi: int = 144,
+    image_format: str = "svg",
+) -> str | None:
+    """Render math as vector SVG by default; PNG remains a compatibility option."""
     try:
         import matplotlib
         matplotlib.use('Agg')
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_agg import FigureCanvasAgg
-        import matplotlib.pyplot as plt
 
-        # 配置字体以支持中文
-        plt.rcParams['mathtext.fontset'] = 'custom'
-        plt.rcParams['mathtext.rm'] = 'Noto Sans CJK JP'
-        plt.rcParams['mathtext.it'] = 'Noto Sans CJK JP:italic'
-        plt.rcParams['mathtext.bf'] = 'Noto Sans CJK JP:bold'
-        plt.rcParams['font.family'] = 'sans-serif'
-        plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'Noto Sans CJK JP', 'SimHei', 'Arial', 'sans-serif']
-        plt.rcParams['axes.unicode_minus'] = False     
-
+        if image_format not in {"svg", "png"}:
+            raise ValueError("unsupported formula image format")
         latex = _preprocess_latex(latex_code)
-        
-        fig = Figure(figsize=(0.01, 0.01))
-        fig.patch.set_alpha(0)
-        FigureCanvasAgg(fig)
+        rc = {
+            "mathtext.fontset": "custom",
+            "mathtext.rm": "Noto Sans CJK JP",
+            "mathtext.it": "Noto Sans CJK JP:italic",
+            "mathtext.bf": "Noto Sans CJK JP:bold",
+            "mathtext.cal": "Noto Sans CJK JP",
+            "mathtext.sf": "Noto Sans CJK JP",
+            "mathtext.tt": "Noto Sans CJK JP",
+            "font.family": "sans-serif",
+            "font.sans-serif": [
+                "Noto Sans CJK SC",
+                "Noto Sans CJK JP",
+                "SimHei",
+                "Arial",
+                "sans-serif",
+            ],
+            "axes.unicode_minus": False,
+            "svg.fonttype": "path",
+        }
 
-        # 尝试渲染
-        text = fig.text(0, 0, f"${latex}$", fontsize=fontsize, usetex=False)
-        fig.canvas.draw()
-        bbox = text.get_window_extent()
+        # Matplotlib keeps shared font/math caches; concurrent PDF jobs must not
+        # mutate them while another formula is being measured or serialized.
+        with _LATEX_RENDER_LOCK, matplotlib.rc_context(rc):
+            fig = Figure(figsize=(0.01, 0.01), dpi=96)
+            fig.patch.set_alpha(0)
+            FigureCanvasAgg(fig)
+            text = fig.text(0, 0, f"${latex}$", fontsize=fontsize, usetex=False)
+            fig.canvas.draw()
+            bbox = text.get_window_extent()
+            width = bbox.width / fig.dpi + 0.12
+            height = bbox.height / fig.dpi + 0.12
+            fig.set_size_inches(width, height)
+            text.set_position((0.06, 0.22))
 
-        width = bbox.width / fig.dpi + 0.1
-        height = bbox.height / fig.dpi + 0.1
-        fig.set_size_inches(width, height)
-        text.set_position((0.05, 0.2))
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0.02, transparent=True)
-        gc.collect()
-
-        buf.seek(0)
-        return base64.b64encode(buf.read()).decode('utf-8')
+            buf = io.BytesIO()
+            save_options = {
+                "format": image_format,
+                "bbox_inches": "tight",
+                "pad_inches": 0.035,
+                "transparent": True,
+            }
+            if image_format == "png":
+                save_options["dpi"] = dpi
+            fig.savefig(buf, **save_options)
+            payload = buf.getvalue()
+            gc.collect()
+        return base64.b64encode(payload).decode("ascii")
 
     except Exception as e:
         logger.warning(f"LaTeX 渲染失败: {e}")
@@ -135,14 +183,16 @@ def _render_latex_inline(latex_code: str, block: bool = False) -> str:
     if not latex:
         return f'$${latex_code}$$' if block else f'${latex_code}$'
     
-    b64 = render_latex_to_base64(latex, fontsize=10, dpi=72)
+    fontsize = BLOCK_FORMULA_FONTSIZE if block else INLINE_FORMULA_FONTSIZE
+    b64 = render_latex_to_base64(latex, fontsize=fontsize, image_format="svg")
     if b64:
+        alt = html.escape(latex[:500], quote=True)
         if block:
-            return (f'<img src="data:image/png;base64,{b64}" '
-                    f'alt="formula" class="block-formula" style="display:block;margin:0 auto;"/>')
+            return (f'<img src="data:image/svg+xml;base64,{b64}" '
+                    f'alt="{alt}" class="block-formula"/>')
         else:
-            return (f'<img src="data:image/png;base64,{b64}" '
-                    f'alt="formula" class="inline-formula"/>')
+            return (f'<img src="data:image/svg+xml;base64,{b64}" '
+                    f'alt="{alt}" class="inline-formula"/>')
     else:
         return f'<code>{latex}</code>'
 
@@ -151,11 +201,16 @@ def process_latex_in_markdown(content: str) -> str:
     """查找 Markdown 中的 LaTeX 公式并替换为图片"""
     def replace_block_latex(match):
         latex = match.group(1).strip()
-        b64 = render_latex_to_base64(latex, fontsize=10, dpi=72)
+        b64 = render_latex_to_base64(
+            latex,
+            fontsize=BLOCK_FORMULA_FONTSIZE,
+            image_format="svg",
+        )
         if b64:
-            return (f'\n\n<p style="text-align:center;">'
-                    f'<img src="data:image/png;base64,{b64}" '
-                    f'alt="formula" class="block-formula"/></p>\n\n')
+            alt = html.escape(latex[:500], quote=True)
+            return (f'\n\n<div class="formula-block">'
+                    f'<img src="data:image/svg+xml;base64,{b64}" '
+                    f'alt="{alt}" class="block-formula"/></div>\n\n')
         return f'\n\n<pre><code>{latex}</code></pre>\n\n'
 
     def replace_math_block(match):
@@ -164,10 +219,15 @@ def process_latex_in_markdown(content: str) -> str:
     def replace_inline_latex(match):
         latex = match.group(1).strip()
         if not latex: return match.group(0)
-        b64 = render_latex_to_base64(latex, fontsize=10, dpi=72)
+        b64 = render_latex_to_base64(
+            latex,
+            fontsize=INLINE_FORMULA_FONTSIZE,
+            image_format="svg",
+        )
         if b64:
-            return (f'<img src="data:image/png;base64,{b64}" '
-                    f'alt="formula" class="inline-formula"/>')
+            alt = html.escape(latex[:500], quote=True)
+            return (f'<img src="data:image/svg+xml;base64,{b64}" '
+                    f'alt="{alt}" class="inline-formula"/>')
         return f'<code>{latex}</code>'
 
     content = re.sub(r'\$\$(.+?)\$\$', replace_block_latex, content, flags=re.DOTALL)
@@ -353,8 +413,27 @@ table { border-collapse: collapse; margin-bottom: 16px; width: 100%; }
 th, td { padding: 6px 13px; border: 1px solid #d1d9e0; }
 tr:nth-child(2n) { background-color: #f6f8fa; }
 img { max-width: 100%; }
-img.block-formula { display: block; margin: 0 auto; }
-.inline-formula { vertical-align: middle; }
+.formula-block {
+    display: block; margin: 0.9em auto 1em; text-align: center;
+    line-height: 1; page-break-inside: avoid;
+}
+img.block-formula {
+    display: block; width: auto; height: auto; max-width: 96%;
+    min-height: 1.65em; margin: 0 auto;
+}
+.video-evidence-frame {
+    margin: 12px auto 16px; text-align: center;
+    break-inside: avoid; page-break-inside: avoid;
+}
+.video-evidence-frame img {
+    display: block; width: auto; max-width: 100%; max-height: 155mm;
+    height: auto; margin: 0 auto; border-radius: 4px;
+}
+.video-evidence-frame figcaption { margin-top: 5px; color: #656d76; font-size: 0.86em; }
+.inline-formula {
+    display: inline-block; width: auto; height: 1.3em;
+    max-width: 45em; vertical-align: -0.28em;
+}
 .author-info { font-size: 1.1em; color: #57606a; margin-bottom: 24px; font-style: italic; }
 """
 
@@ -386,11 +465,12 @@ def generate_pdf(markdown_content: str, output_path: str, author: str = "") -> b
 <body class="markdown-body">{html_content}</body>
 </html>"""
 
-        html = HTML(string=full_html)
+        html = HTML(string=full_html, url_fetcher=_safe_pdf_url_fetcher)
         css = CSS(string=GITHUB_PDF_CSS)
-        html.write_pdf(output_path, stylesheets=[css])
+        document = html.render(stylesheets=[css])
+        document.write_pdf(output_path)
 
-        logger.info(f"PDF 生成成功: {output_path}")
+        logger.info("PDF 生成成功: %s pages=%s", output_path, len(document.pages))
         return True
 
     except Exception as e:

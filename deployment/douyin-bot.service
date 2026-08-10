@@ -1,6 +1,9 @@
 [Unit]
 Description=Douyin Video Summarizer Bot
-After=network.target
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -8,9 +11,34 @@ User=root
 Group=root
 WorkingDirectory=/root/douyin-bot
 EnvironmentFile=/root/douyin-bot/.env
-ExecStart=/usr/bin/python3.8 -m uvicorn main:app --host 0.0.0.0 --port 8080
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=MPLCONFIGDIR=/tmp/douyin-bot/matplotlib
+Environment=XDG_CACHE_HOME=/tmp/douyin-bot/cache
+Environment=SERVER_HOST=127.0.0.1
+Environment=SERVER_PORT=8080
+ExecStart=/root/douyin-bot/venv/bin/python -m uvicorn main:app --host ${SERVER_HOST} --port ${SERVER_PORT} --workers 1
 Restart=always
 RestartSec=5
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/root/douyin-bot
+ReadOnlyPaths=/root/douyin-bot/.env /root/douyin-bot/app /root/douyin-bot/deployment /root/douyin-bot/scripts /root/douyin-bot/tests /root/douyin-bot/venv /root/douyin-bot/main.py /root/douyin-bot/mcp_server.py /root/douyin-bot/requirements.txt
+CapabilityBoundingSet=
+LimitNOFILE=8192
+TasksMax=256
+MemoryMax=2G
 StandardOutput=journal
 StandardError=journal
 

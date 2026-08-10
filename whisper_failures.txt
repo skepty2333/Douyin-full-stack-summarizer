@@ -1,5 +1,0 @@
-Feb 10 01:09:00 iZk1a8pa5fv4uxiv7s23grZ python3.8[260341]: 2026-02-10 01:09:00 [WARNING] ai_summarizer: [Stage1] 多模态失败, 回退转写+总结:
-Feb 11 02:19:07 iZk1a8pa5fv4uxiv7s23grZ python3.11[86448]: 2026-02-11 02:19:07 [WARNING] app.services.ai_summarizer: [Stage1] 失败，回退:
-Feb 11 16:01:15 iZk1a8pa5fv4uxiv7s23grZ python3.11[97501]: 2026-02-11 16:01:15 [WARNING] app.services.ai_summarizer: [Stage1] 失败，回退:
-Feb 11 18:59:18 iZk1a8pa5fv4uxiv7s23grZ python3.11[163885]: 2026-02-11 18:59:18 [WARNING] app.services.ai_summarizer: [Stage1] 失败，回退: Client error '429 Too Many Requests' for url 'https://api1.uiuiapi.com/v1/chat/completions'
-Feb 12 12:15:07 iZk1a8pa5fv4uxiv7s23grZ python3.11[174798]: 2026-02-12 12:15:07 [WARNING] app.services.ai_summarizer: [Stage1] 失败，回退: Client error '413 Request Entity Too Large' for url 'https://sg.uiuiapi.com/v1/chat/completions'
