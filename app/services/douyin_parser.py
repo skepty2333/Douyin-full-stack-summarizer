@@ -9,16 +9,37 @@ import time
 import uuid
 import httpx
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Any, Optional
+from urllib.parse import urlencode, urlparse
 from app.config import TEMP_DIR, TEMP_FILE_TTL_HOURS
+from app.services.douyin_abogus import ABogus, BrowserFingerprintGenerator
 
 logger = logging.getLogger(__name__)
 
-# 模拟移动端 UA
+DESKTOP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/139.0.0.0 Safari/537.36"
+)
+
+# 短链与分享页继续使用移动端 UA；作品详情接口要求桌面端参数与 UA 一致。
 MOBILE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/121.0.2277.107 Version/17.0 Mobile/15E148 Safari/604.1'
 }
+DOUYIN_WEB_HEADERS = {
+    "User-Agent": DESKTOP_USER_AGENT,
+    "Referer": "https://www.douyin.com/?recommend=1",
+    "Accept": "*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+DOUYIN_DOWNLOAD_HEADERS = {
+    "User-Agent": DESKTOP_USER_AGENT,
+    "Referer": "https://www.douyin.com/",
+    "Accept": "*/*",
+}
+TTWID_REGISTER_URL = "https://ttwid.bytedance.com/ttwid/union/register/"
+DOUYIN_DETAIL_URL = "https://www.douyin.com/aweme/v1/web/aweme/detail/"
+DETAIL_AID_CANDIDATES = ("6383", "1128")
 
 
 def extract_url_from_text(text: str) -> Optional[str]:
@@ -59,6 +80,227 @@ def extract_user_requirement(text: str, url: str) -> str:
     return re.sub(r'\s+', ' ', remaining).strip()
 
 
+def _extract_video_id(url: str) -> str:
+    """Extract a Douyin work ID from a redirected share URL."""
+    parsed = urlparse(url)
+    path_matches = re.findall(r"(?<!\d)\d{15,22}(?!\d)", parsed.path)
+    if path_matches:
+        return path_matches[-1]
+    query_match = re.search(r"(?:^|[?&])(?:modal_id|vid)=(\d{15,22})(?:&|$)", url)
+    return query_match.group(1) if query_match else ""
+
+
+def _extract_router_item(html: str) -> Optional[dict[str, Any]]:
+    """Read an item from the legacy share-page ``_ROUTER_DATA`` payload."""
+    match = re.search(
+        r"window\._ROUTER_DATA\s*=\s*(.*?)</script>",
+        html,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(1).strip())
+    except (TypeError, json.JSONDecodeError):
+        logger.warning("_ROUTER_DATA JSON 解析失败")
+        return None
+
+    loader_data = data.get("loaderData") or {}
+    for route_name in ("video_(id)/page", "note_(id)/page"):
+        route_data = loader_data.get(route_name) or {}
+        video_info = route_data.get("videoInfoRes") or {}
+        item_list = video_info.get("item_list") or []
+        if item_list and isinstance(item_list[0], dict):
+            return item_list[0]
+    return None
+
+
+def _normalize_video_url(url: str) -> str:
+    normalized = str(url or "").strip()
+    if normalized.startswith("//"):
+        normalized = "https:" + normalized
+    if normalized.startswith("http://"):
+        normalized = "https://" + normalized[len("http://") :]
+    return normalized.replace("playwm", "play")
+
+
+def _select_video_url(item: dict[str, Any]) -> str:
+    """Select an H.264 MP4 URL, preferring a direct CDN over redirect APIs."""
+    video = item.get("video") or {}
+    addresses: list[dict[str, Any]] = []
+
+    for key in ("play_addr", "play_addr_h264"):
+        address = video.get(key)
+        if isinstance(address, dict):
+            addresses.append(address)
+
+    h264_rates = [
+        rate
+        for rate in (video.get("bit_rate") or [])
+        if isinstance(rate, dict) and not rate.get("is_h265")
+    ]
+    h264_rates.sort(
+        key=lambda rate: int(
+            (rate.get("play_addr") or {}).get("data_size")
+            or rate.get("bit_rate")
+            or 0
+        ),
+        reverse=True,
+    )
+    addresses.extend(
+        rate["play_addr"]
+        for rate in h264_rates
+        if isinstance(rate.get("play_addr"), dict)
+    )
+
+    download_address = video.get("download_addr")
+    if isinstance(download_address, dict):
+        addresses.append(download_address)
+
+    seen: set[str] = set()
+    for address in addresses:
+        candidates = [
+            _normalize_video_url(candidate)
+            for candidate in (address.get("url_list") or [])
+        ]
+        candidates.sort(
+            key=lambda candidate: urlparse(candidate).hostname in {
+                "www.douyin.com",
+                "www.iesdouyin.com",
+            }
+        )
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if urlparse(candidate).scheme in {"http", "https"}:
+                return candidate
+    return ""
+
+
+def _detail_query(video_id: str, aid: str) -> str:
+    params = {
+        "device_platform": "webapp",
+        "aid": aid,
+        "channel": "channel_pc_web",
+        "update_version_code": "170400",
+        "pc_client_type": "1",
+        "pc_libra_divert": "Windows",
+        "version_code": "290100",
+        "version_name": "29.1.0",
+        "cookie_enabled": "true",
+        "screen_width": "1536",
+        "screen_height": "864",
+        "browser_language": "zh-CN",
+        "browser_platform": "Win32",
+        "browser_name": "Chrome",
+        "browser_version": "139.0.0.0",
+        "browser_online": "true",
+        "engine_name": "Blink",
+        "engine_version": "139.0.0.0",
+        "os_name": "Windows",
+        "os_version": "10",
+        "cpu_core_num": "16",
+        "device_memory": "8",
+        "platform": "PC",
+        "downlink": "10",
+        "effective_type": "4g",
+        "round_trip_time": "200",
+        "support_h265": "1",
+        "support_dash": "0",
+        "uifid": "",
+        "aweme_id": video_id,
+    }
+    return urlencode(params)
+
+
+async def _register_ttwid(client: httpx.AsyncClient) -> str:
+    """Create the anonymous visitor cookie required by Douyin's web API."""
+    response = await client.post(
+        TTWID_REGISTER_URL,
+        headers=DOUYIN_WEB_HEADERS,
+        json={
+            "region": "cn",
+            "aid": 1768,
+            "needFid": False,
+            "service": "www.douyin.com",
+            "migrate_info": {"ticket": "", "source": "node"},
+            "cbUrlProtocol": "https",
+            "union": True,
+        },
+    )
+    response.raise_for_status()
+    ttwid = response.cookies.get("ttwid", "").strip()
+    if not ttwid:
+        raise ValueError("ttwid 注册响应缺少 Cookie")
+
+    # The registration endpoint owns a bytedance.com cookie.  Copy the same
+    # visitor value to Douyin so httpx sends it to the detail API.
+    client.cookies.set("ttwid", ttwid, domain="www.douyin.com", path="/")
+    return ttwid
+
+
+async def _fetch_aweme_detail(
+    client: httpx.AsyncClient,
+    video_id: str,
+) -> Optional[dict[str, Any]]:
+    """Fetch the current signed web-detail payload with anonymous cookies."""
+    for attempt in range(1, 3):
+        try:
+            await _register_ttwid(client)
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning(
+                "ttwid 注册失败: attempt=%s/2 error=%s",
+                attempt,
+                type(exc).__name__,
+            )
+            continue
+
+        for aid in DETAIL_AID_CANDIDATES:
+            query = _detail_query(video_id, aid)
+            signer = ABogus(
+                fp=BrowserFingerprintGenerator.generate_fingerprint("Chrome"),
+                user_agent=DESKTOP_USER_AGENT,
+            )
+            signed_query, _, signed_ua, _ = signer.generate_abogus(query)
+            try:
+                response = await client.get(
+                    f"{DOUYIN_DETAIL_URL}?{signed_query}",
+                    headers={**DOUYIN_WEB_HEADERS, "User-Agent": signed_ua},
+                )
+                response.raise_for_status()
+                if not response.content:
+                    logger.warning(
+                        "作品详情接口返回空响应: aid=%s attempt=%s/2",
+                        aid,
+                        attempt,
+                    )
+                    continue
+                payload = response.json()
+            except (httpx.HTTPError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "作品详情接口失败: aid=%s attempt=%s/2 error=%s",
+                    aid,
+                    attempt,
+                    type(exc).__name__,
+                )
+                continue
+
+            detail = payload.get("aweme_detail") if isinstance(payload, dict) else None
+            if not isinstance(detail, dict):
+                logger.warning(
+                    "作品详情为空: aid=%s status_code=%s",
+                    aid,
+                    payload.get("status_code") if isinstance(payload, dict) else None,
+                )
+                continue
+            if str(detail.get("aweme_id") or "") != video_id:
+                logger.warning("作品详情 ID 不匹配: expected=%s", video_id)
+                continue
+            return detail
+    return None
+
+
 def _job_directory(job_id: str) -> Path:
     """Return an isolated, validated temporary directory for one job."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", job_id):
@@ -84,43 +326,22 @@ async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> 
             resp = await client.get(share_url)
             resp.raise_for_status()
             final_url = str(resp.url)
-            path = final_url.split('?')[0]
-            video_id = path.split('/')[-1]
-            if not video_id.isdigit():
-                 ids = re.findall(r'\d{19}', path)
-                 if ids: video_id = ids[0]
-            
-            if not video_id: raise ValueError("无法提取视频ID")
-            
-            # 2. 请求分享页获取 _ROUTER_DATA
-            ies_url = f'https://www.iesdouyin.com/share/video/{video_id}'
-            resp = await client.get(ies_url)
-            resp.raise_for_status()
-            html = resp.text
-            
-            pattern = re.compile(r"window\._ROUTER_DATA\s*=\s*(.*?)</script>", re.DOTALL)
-            match = pattern.search(html)
-            
-            if match:
-                data = json.loads(match.group(1).strip())
-                loader_data = data.get("loaderData", {})
-                video_info = loader_data.get("video_(id)/page", {}).get("videoInfoRes") or \
-                             loader_data.get("note_(id)/page", {}).get("videoInfoRes")
-                
-                if video_info and "item_list" in video_info and video_info["item_list"]:
-                    item = video_info["item_list"][0]
-                    title = item.get("desc", title)
-                    author = item.get("author", {}).get("nickname", author)
-                    
-                    if "video" in item and "play_addr" in item["video"]:
-                        url_list = item["video"]["play_addr"]["url_list"]
-                        if url_list:
-                             video_url = url_list[0].replace("playwm", "play")
-                             if video_url.startswith("//"): video_url = "https:" + video_url
-                else:
-                    logger.warning(f"JSON中未找到有效视频信息: videoInfoRes={bool(video_info)}")
+            video_id = _extract_video_id(final_url)
+            if not video_id:
+                raise ValueError("无法提取视频ID")
+
+            # 2. 优先兼容旧分享页；页面数据降级为空时切换到当前签名接口。
+            item = _extract_router_item(resp.text)
+            if item is None:
+                logger.info("分享页无作品数据，切换到签名详情接口")
+                item = await _fetch_aweme_detail(client, video_id)
+
+            if item:
+                title = item.get("desc") or title
+                author = (item.get("author") or {}).get("nickname") or author
+                video_url = _select_video_url(item)
             else:
-                logger.warning("_ROUTER_DATA 未找到")
+                logger.warning("抖音作品详情中未找到有效视频信息")
                 
         except Exception as exc:
             logger.error("抖音页面解析失败: %s", type(exc).__name__)
@@ -160,7 +381,7 @@ async def _download_video(
                 max_retries,
                 urlparse(video_url).hostname or "unknown",
             )
-            async with httpx.AsyncClient(headers=MOBILE_HEADERS, follow_redirects=True, timeout=120) as client:
+            async with httpx.AsyncClient(headers=DOUYIN_DOWNLOAD_HEADERS, follow_redirects=True, timeout=120) as client:
                 async with client.stream("GET", video_url) as resp:
                     resp.raise_for_status()
                     content_type = resp.headers.get("content-type", "").lower()

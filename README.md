@@ -72,6 +72,22 @@ Stage2 在所有档位关闭思考。Stage3 的思考预算和输出护栏只由
 
 篇幅是软护栏，不是凑字目标。终稿以视频语音和画面为主体，研究内容只用于解决理解障碍、重大事实问题和适用边界；正常流程不会向企业微信发送四个 AI 阶段的进度消息，仅在 FileTrans 失败并切换本地识别等降级场景发送必要提示。
 
+### 模型用量与费用观测
+
+该功能默认关闭。需要开始观测时，在 `.env` 设置 `MODEL_USAGE_LOG_ENABLED=true` 并重启 Bot；之后每次逻辑模型调用会写入 SQLite 的 `model_usage_log`。记录包括任务 ID、视频码、模型、处理环节、成功/失败/取消、起止时间、耗时、请求与重试次数、服务端 request ID、输入/输出/缓存/推理 Token、音频时长和价格快照下的估算费用。视觉分析、截图审核、联网研究、终稿和标签会分别标识；一次 HTTP 重试不会被误记成多次业务调用。
+
+观测日志不保存提示词、逐字稿、模型输出、用户 ID、API Key 或媒体 URL。当前规则 `aliyun-cn-beijing-2026-08-15` 按[阿里云百炼中国内地计费页面](https://help.aliyun.com/zh/model-studio/model-pricing)核对人民币阶梯价：`qwen3.7-flash` 为输入 ¥0.2/¥0.6/¥1.2、输出 ¥0.8/¥2.4/¥4.8（对应输入长度 ≤32K/≤256K/≤1M）；`qwen3.7-plus` 滚动别名按当日限时价输入 ¥1.6/¥4.8、输出 ¥6.4/¥19.2（≤256K/≤1M）；`qwen3.8-max` 输入 ¥12、输出 ¥36。缓存输入按对应模型与档位单独计价，两条 ASR 路径都按 ¥0.00022/音频秒估算。
+
+估算费用不等于账单：它不含内置联网搜索等附加费用，也不抵扣免费额度，后续促销或调价不会追溯改写历史行；每条记录保留当时的 `pricing_version`、币种和费率。服务端缺少 usage、失败调用收费不明、超出已登记档位或模型未登记时，费用保留为“未知”，不会错误按 0 计算。即使采集开关关闭，也可以用报表读取数据库中已有记录。
+
+```bash
+# 最近 7 天汇总
+venv/bin/python scripts/model_usage_report.py --days 7
+
+# 同时查看最近 200 次调用明细，也可加 --job-id 精确筛选
+venv/bin/python scripts/model_usage_report.py --days 7 --details --limit 200
+```
+
 ### 截图、知识库与交付
 
 - FFmpeg 在视觉注释目标时间附近抽取三个候选帧，本地按细节、曝光和对比度择优。
@@ -135,6 +151,7 @@ DASHSCOPE_NATIVE_BASE_URL=https://YOUR_WORKSPACE_ID.cn-beijing.maas.aliyuncs.com
 | AI 容量 | `AI_REQUEST_TIMEOUT_SECONDS`、`AI_MAX_RETRIES`、`AI_MAX_CONCURRENCY` |
 | 任务容量 | `MAX_CONCURRENT_JOBS`、`JOB_TIMEOUT_SECONDS`、`DOWNLOAD_TIMEOUT_SECONDS` |
 | ASR 回退 | `ASR_SEGMENT_SECONDS`、`ASR_MAX_FILE_MB`、`ASR_FILE_POLL_INTERVAL_SECONDS`、`ASR_FILE_TIMEOUT_SECONDS` |
+| 用量观测 | `MODEL_USAGE_LOG_ENABLED`、`MODEL_USAGE_DB_PATH` |
 | 数据与服务 | `TEMP_DIR`、`TEMP_FILE_TTL_HOURS`、`KNOWLEDGE_DB_PATH`、`KNOWLEDGE_ASSETS_DIR`、`SERVER_HOST`、`SERVER_PORT`、`MCP_HOST`、`MCP_PORT` |
 
 新部署默认让 Bot 和 MCP 都只监听 loopback，由反向代理承担 TLS 与公网边界。只有在已经具备安全组、防火墙或其他受控网络边界时，才应显式改为其他监听地址。
@@ -201,7 +218,7 @@ journalctl -u douyin-bot -u douyin-mcp -f
 
 以下运行数据默认被 `.gitignore` 排除，不会随着代码推送到 GitHub：
 
-- `knowledge.db` 及其 `-wal`、`-shm` 文件：笔记、标签和图片清单。
+- `knowledge.db` 及其 `-wal`、`-shm` 文件：笔记、标签、图片清单；开启用量观测后默认也包含 `model_usage_log` 调用观测表。
 - `knowledge_assets/`：审核后、按内容哈希存放的 JPEG。
 - `.env`：企业微信凭据和百炼 API Key。
 - `/tmp/douyin-bot/jobs/`：会自动清理的临时任务文件。
@@ -217,6 +234,7 @@ journalctl -u douyin-bot -u douyin-mcp -f
 ├── app/
 │   ├── config.py                   # 环境变量与本地配置校验
 │   ├── database/knowledge_store.py # SQLite、FTS5、图片清单与完整性校验
+│   ├── database/model_usage_store.py # 模型调用明细、价格快照与汇总
 │   └── services/
 │       ├── aliyun_client.py        # 百炼原生/兼容接口、超时、并发与重试
 │       ├── ai_summarizer.py        # ASR、并行视觉/研究、终稿和标签
@@ -226,6 +244,7 @@ journalctl -u douyin-bot -u douyin-mcp -f
 │       └── wechat_api.py           # 企业微信 Token、消息和文件上传
 ├── deployment/                     # systemd 与 Nginx 模板
 ├── scripts/setup.sh                # Alibaba Cloud Linux 3 安装脚本
+├── scripts/model_usage_report.py   # Token、音频时长与费用只读报表
 ├── tests/                          # 离线单元与集成边界测试
 ├── PROJECT_DETAILS.md              # 完整架构与实现约束
 ├── requirements.txt                # 锁定的 Python 依赖
@@ -240,9 +259,10 @@ venv/bin/python -m unittest discover -s tests -v
 venv/bin/python -m compileall -q app main.py mcp_server.py
 venv/bin/python -m pip check
 systemd-analyze verify deployment/douyin-bot.service deployment/douyin-mcp.service
+venv/bin/python scripts/model_usage_report.py --days 7
 ```
 
-测试覆盖动态时长档、FileTrans 与本地回退、Stage1/Stage2 并行、逐字稿完整性、截图独立审核、路径与大小限制、内容寻址图片、MCP 多模态取图、公式 PDF、企业微信分段发送和队列状态转换。付费模型权限、抖音页面可用性与企业微信回调仍需通过受控的端到端任务验证。
+测试覆盖动态时长档、FileTrans 与本地回退、Stage1/Stage2 并行、逐字稿完整性、截图独立审核、调用日志隐私边界、Token/缓存/音频计费、路径与大小限制、内容寻址图片、MCP 多模态取图、公式 PDF、企业微信分段发送和队列状态转换。付费模型权限、抖音页面可用性与企业微信回调仍需通过受控的端到端任务验证。
 
 ## 已知边界
 

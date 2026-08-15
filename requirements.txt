@@ -2,6 +2,7 @@ fastapi==0.115.6
 uvicorn==0.40.0
 python-dotenv==1.2.1
 httpx==0.28.1
+gmssl==3.2.2
 weasyprint==60.0
 pydyf==0.8.0
 pycryptodome==3.21.0

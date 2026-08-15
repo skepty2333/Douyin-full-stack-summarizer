@@ -28,6 +28,7 @@ from app.config import (
     CORP_ID, CALLBACK_TOKEN, CALLBACK_AES_KEY,
     TEMP_DIR, LOG_LEVEL, SERVER_HOST, SERVER_PORT,
     KNOWLEDGE_ASSETS_DIR, MAX_CONCURRENT_JOBS, JOB_TIMEOUT_SECONDS, DOWNLOAD_TIMEOUT_SECONDS,
+    MODEL_USAGE_LOG_ENABLED,
     validate_ai_config,
 )
 from app.utils.wechat_crypto import WXBizMsgCrypt
@@ -51,6 +52,10 @@ from app.services.video_frames import (
     strip_video_frame_markers_for_storage,
 )
 from app.database.knowledge_store import KnowledgeAsset, KnowledgeStore, KnowledgeEntry
+from app.database.model_usage_store import (
+    bind_model_usage_context,
+    get_model_usage_store,
+)
 
 # 初始化
 logging.basicConfig(
@@ -187,6 +192,11 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(knowledge_db.prune_orphan_assets)
     except Exception:
         logger.exception("清理过期孤儿知识图片失败，继续启动")
+    if MODEL_USAGE_LOG_ENABLED:
+        try:
+            await asyncio.to_thread(get_model_usage_store)
+        except Exception:
+            logger.exception("模型调用日志数据库初始化失败")
     _accepting_messages = True
     logger.info("Bot 启动")
     yield
@@ -575,19 +585,26 @@ async def _execute_summary_task(
                 async def progress(msg):
                     await _safe_send_text(user_id, msg)
 
-                summary_result = await summarize_with_artifacts(
-                    task.parsed_video_path,
-                    task.parsed_title,
-                    task.parsed_author,
-                    req,
-                    progress_callback=progress,
-                    media_url=task.parsed_media_url,
-                )
-                summary = strip_video_frame_markers_for_storage(
-                    summary_result.markdown
-                )
-
-                tags = await generate_tags_with_ai(summary, task.parsed_title, task.parsed_author)
+                with bind_model_usage_context(
+                    job_id=task.job_id,
+                    video_code=video_code,
+                ):
+                    summary_result = await summarize_with_artifacts(
+                        task.parsed_video_path,
+                        task.parsed_title,
+                        task.parsed_author,
+                        req,
+                        progress_callback=progress,
+                        media_url=task.parsed_media_url,
+                    )
+                    summary = strip_video_frame_markers_for_storage(
+                        summary_result.markdown
+                    )
+                    tags = await generate_tags_with_ai(
+                        summary,
+                        task.parsed_title,
+                        task.parsed_author,
+                    )
                 storage_summary, persisted_frames = await asyncio.to_thread(
                     persist_video_frame_markers_for_storage,
                     summary_result.markdown,
@@ -728,6 +745,13 @@ async def readiness_check():
             problems.append("知识库健康检查失败")
     except Exception as exc:
         problems.append(f"知识库不可用: {type(exc).__name__}")
+    if MODEL_USAGE_LOG_ENABLED:
+        try:
+            usage_store = await asyncio.to_thread(get_model_usage_store)
+            if not await asyncio.to_thread(usage_store.health_check):
+                problems.append("模型调用日志库健康检查失败")
+        except Exception as exc:
+            problems.append(f"模型调用日志库不可用: {type(exc).__name__}")
     try:
         os.makedirs(TEMP_DIR, exist_ok=True)
         if not os.access(TEMP_DIR, os.W_OK):

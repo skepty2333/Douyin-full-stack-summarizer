@@ -8,7 +8,9 @@ import json
 import logging
 import math
 import random
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from urllib.error import HTTPError, URLError
@@ -24,12 +26,23 @@ from app.config import (
     DASHSCOPE_API_KEY,
     DASHSCOPE_BASE_URL,
     DASHSCOPE_NATIVE_BASE_URL,
+    MODEL_USAGE_LOG_ENABLED,
 )
+from app.database.model_usage_store import ModelUsageStore, get_model_usage_store
 
 
 logger = logging.getLogger(__name__)
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 _MAX_TRANSCRIPTION_JSON_BYTES = 32 * 1024 * 1024
+
+
+@dataclass(slots=True)
+class _RequestMetrics:
+    """Mutable counters for one logical provider call."""
+
+    request_count: int = 0
+    retry_count: int = 0
+    provider_request_id: str = ""
 
 
 class AliyunAPIError(RuntimeError):
@@ -90,6 +103,8 @@ class AliyunModelClient:
         result_loader: Optional[
             Callable[[str], Awaitable[dict[str, Any]]]
         ] = None,
+        usage_store: Optional[ModelUsageStore] = None,
+        usage_store_factory: Optional[Callable[[], ModelUsageStore]] = None,
     ):
         self.api_key = api_key.strip()
         self.base_url = base_url.rstrip("/")
@@ -99,6 +114,8 @@ class AliyunModelClient:
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._sleep = sleep
         self._result_loader = result_loader
+        self._usage_store = usage_store
+        self._usage_store_factory = usage_store_factory
         self._client = httpx.AsyncClient(
             base_url=f"{self.base_url}/",
             follow_redirects=True,
@@ -128,6 +145,7 @@ class AliyunModelClient:
         extra_headers: Optional[dict[str, str]] = None,
         authorize: bool = True,
         retry: bool = True,
+        metrics: Optional[_RequestMetrics] = None,
     ) -> dict[str, Any]:
         self._check_configuration()
         headers = dict(extra_headers or {})
@@ -138,6 +156,8 @@ class AliyunModelClient:
         async with self._semaphore:
             for attempt in range(attempt_limit + 1):
                 try:
+                    if metrics is not None:
+                        metrics.request_count += 1
                     request_kwargs: dict[str, Any] = {"headers": headers}
                     if payload is not None:
                         request_kwargs["json"] = payload
@@ -147,6 +167,8 @@ class AliyunModelClient:
                         raise AliyunAPIError(
                             f"百炼网络请求失败（已重试 {attempt} 次）: {type(exc).__name__}"
                         ) from exc
+                    if metrics is not None:
+                        metrics.retry_count += 1
                     await self._wait_before_retry(attempt, None)
                     continue
 
@@ -157,6 +179,15 @@ class AliyunModelClient:
                         raise AliyunAPIError("百炼返回了无效 JSON", response.status_code) from exc
                     if not isinstance(data, dict):
                         raise AliyunAPIError("百炼返回格式异常", response.status_code)
+                    if metrics is not None:
+                        request_id = (
+                            response.headers.get("x-request-id")
+                            or response.headers.get("x-dashscope-request-id")
+                            or data.get("request_id")
+                            or data.get("id")
+                        )
+                        if isinstance(request_id, str) and request_id.strip():
+                            metrics.provider_request_id = request_id.strip()[:256]
                     return data
 
                 message = self._extract_error(response)
@@ -169,12 +200,93 @@ class AliyunModelClient:
                     attempt + 1,
                     attempt_limit,
                 )
+                if metrics is not None:
+                    metrics.retry_count += 1
                 await self._wait_before_retry(attempt, response)
 
         raise AliyunAPIError("百炼请求异常退出")
 
-    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request_json("POST", path, payload=payload)
+    async def _post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        metrics: Optional[_RequestMetrics] = None,
+    ) -> dict[str, Any]:
+        return await self._request_json("POST", path, payload=payload, metrics=metrics)
+
+    async def _record_model_call(
+        self,
+        *,
+        model: str,
+        operation: str,
+        api_kind: str,
+        status: str,
+        started_at: str,
+        started_monotonic: float,
+        metrics: _RequestMetrics,
+        response_payload: Optional[dict[str, Any]] = None,
+        audio_seconds: Optional[float] = None,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Best-effort telemetry: observability must never break model output."""
+
+        if self._usage_store is None and self._usage_store_factory is None:
+            return
+        finished_at = datetime.now(timezone.utc).isoformat()
+        latency_ms = max(0, round((time.monotonic() - started_monotonic) * 1000))
+        http_status = error.status_code if isinstance(error, AliyunAPIError) else None
+        if error is None:
+            error_type = ""
+            error_message = ""
+        elif isinstance(error, AliyunAPIError):
+            error_type = type(error).__name__
+            error_message = (
+                f"百炼调用失败（HTTP {error.status_code}）"
+                if error.status_code is not None
+                else "百炼调用失败（详情见服务日志）"
+            )
+        elif isinstance(error, asyncio.CancelledError):
+            error_type = type(error).__name__
+            error_message = "调用被取消"
+        elif isinstance(error, asyncio.TimeoutError):
+            error_type = type(error).__name__
+            error_message = "调用超时"
+        else:
+            error_type = type(error).__name__
+            error_message = "调用失败（详情见服务日志）"
+
+        def write() -> None:
+            store = self._usage_store
+            if store is None and self._usage_store_factory is not None:
+                store = self._usage_store_factory()
+            if store is None:
+                return
+            store.record(
+                model=model,
+                operation=operation,
+                api_kind=api_kind,
+                status=status,
+                started_at=started_at,
+                finished_at=finished_at,
+                latency_ms=latency_ms,
+                request_count=metrics.request_count,
+                retry_count=metrics.retry_count,
+                provider_request_id=metrics.provider_request_id,
+                http_status=http_status,
+                error_type=error_type,
+                error_message=error_message,
+                response_payload=response_payload,
+                audio_seconds=audio_seconds,
+            )
+
+        try:
+            write_task = asyncio.create_task(asyncio.to_thread(write))
+            await asyncio.shield(write_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("写入模型调用日志失败，继续返回模型结果")
 
     def _native_url(self, path: str) -> str:
         return f"{self.native_base_url}/{path.lstrip('/')}"
@@ -276,6 +388,7 @@ class AliyunModelClient:
         thinking_budget: Optional[int] = None,
         preserve_thinking: Optional[bool] = None,
         response_format: Optional[dict[str, Any]] = None,
+        operation: str = "chat",
     ) -> str:
         payload: dict[str, Any] = {
             "model": model,
@@ -296,8 +409,37 @@ class AliyunModelClient:
             payload["preserve_thinking"] = preserve_thinking
         if response_format is not None:
             payload["response_format"] = response_format
-        data = await self._post("chat/completions", payload)
-        return self._extract_content(data)
+        started_at = datetime.now(timezone.utc).isoformat()
+        started_monotonic = time.monotonic()
+        metrics = _RequestMetrics()
+        data: Optional[dict[str, Any]] = None
+        try:
+            data = await self._post("chat/completions", payload, metrics=metrics)
+            content = self._extract_content(data)
+        except BaseException as exc:
+            await self._record_model_call(
+                model=model,
+                operation=operation,
+                api_kind="chat_completions",
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                metrics=metrics,
+                response_payload=data,
+                error=exc,
+            )
+            raise
+        await self._record_model_call(
+            model=model,
+            operation=operation,
+            api_kind="chat_completions",
+            status="success",
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            metrics=metrics,
+            response_payload=data,
+        )
+        return content
 
     async def responses(
         self,
@@ -307,6 +449,7 @@ class AliyunModelClient:
         tools: Optional[list[dict[str, Any]]] = None,
         max_output_tokens: int = 16384,
         enable_thinking: bool = True,
+        operation: str = "responses",
     ) -> str:
         payload: dict[str, Any] = {
             "model": model,
@@ -317,8 +460,37 @@ class AliyunModelClient:
         }
         if tools:
             payload["tools"] = tools
-        data = await self._post("responses", payload)
-        return self._extract_response_text(data)
+        started_at = datetime.now(timezone.utc).isoformat()
+        started_monotonic = time.monotonic()
+        metrics = _RequestMetrics()
+        data: Optional[dict[str, Any]] = None
+        try:
+            data = await self._post("responses", payload, metrics=metrics)
+            content = self._extract_response_text(data)
+        except BaseException as exc:
+            await self._record_model_call(
+                model=model,
+                operation=operation,
+                api_kind="responses",
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                metrics=metrics,
+                response_payload=data,
+                error=exc,
+            )
+            raise
+        await self._record_model_call(
+            model=model,
+            operation=operation,
+            api_kind="responses",
+            status="success",
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            metrics=metrics,
+            response_payload=data,
+        )
+        return content
 
     async def transcribe_audio(
         self,
@@ -327,6 +499,8 @@ class AliyunModelClient:
         audio_path: str,
         context: str = "",
         language: Optional[str] = None,
+        audio_duration_seconds: Optional[float] = None,
+        operation: str = "asr_fallback",
     ) -> str:
         path = Path(audio_path)
         audio_bytes = await asyncio.to_thread(path.read_bytes)
@@ -357,8 +531,39 @@ class AliyunModelClient:
             "stream": False,
             "asr_options": asr_options,
         }
-        data = await self._post("chat/completions", payload)
-        return self._extract_content(data)
+        started_at = datetime.now(timezone.utc).isoformat()
+        started_monotonic = time.monotonic()
+        metrics = _RequestMetrics()
+        data: Optional[dict[str, Any]] = None
+        try:
+            data = await self._post("chat/completions", payload, metrics=metrics)
+            content = self._extract_content(data)
+        except BaseException as exc:
+            await self._record_model_call(
+                model=model,
+                operation=operation,
+                api_kind="audio_chat_completions",
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                metrics=metrics,
+                response_payload=data,
+                audio_seconds=audio_duration_seconds,
+                error=exc,
+            )
+            raise
+        await self._record_model_call(
+            model=model,
+            operation=operation,
+            api_kind="audio_chat_completions",
+            status="success",
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            metrics=metrics,
+            response_payload=data,
+            audio_seconds=audio_duration_seconds,
+        )
+        return content
 
     @staticmethod
     def _extract_transcription_urls(output: dict[str, Any]) -> list[str]:
@@ -504,8 +709,15 @@ class AliyunModelClient:
             raise AliyunAPIError("百炼转写结果格式异常")
         return data
 
-    async def _download_transcription_json(self, result_url: str) -> dict[str, Any]:
+    async def _download_transcription_json(
+        self,
+        result_url: str,
+        *,
+        metrics: Optional[_RequestMetrics] = None,
+    ) -> dict[str, Any]:
         if self._result_loader is not None:
+            if metrics is not None:
+                metrics.request_count += 1
             data = await self._result_loader(result_url)
             if not isinstance(data, dict):
                 raise AliyunAPIError("百炼转写结果格式异常")
@@ -513,6 +725,8 @@ class AliyunModelClient:
 
         for attempt in range(self.max_retries + 1):
             try:
+                if metrics is not None:
+                    metrics.request_count += 1
                 return await asyncio.to_thread(
                     self._load_transcription_json_sync,
                     result_url,
@@ -528,6 +742,8 @@ class AliyunModelClient:
                     raise AliyunAPIError(
                         f"百炼转写结果下载失败: {type(exc).__name__}"
                     ) from exc
+            if metrics is not None:
+                metrics.retry_count += 1
             await self._wait_before_retry(attempt, None)
         raise AliyunAPIError("百炼转写结果下载异常退出")
 
@@ -540,24 +756,21 @@ class AliyunModelClient:
         channel_ids: Optional[list[int]] = None,
         poll_interval: float = 2.0,
         timeout: float = 1800.0,
+        audio_duration_seconds: Optional[float] = None,
+        operation: str = "asr_filetrans",
     ) -> str:
         """Run FileTrans under a real wall-clock deadline."""
-        if poll_interval <= 0 or timeout <= 0:
-            raise ValueError("poll_interval 和 timeout 必须大于 0")
-        try:
-            return await asyncio.wait_for(
-                self._transcribe_file_url_impl(
-                    model=model,
-                    file_url=file_url,
-                    language_hints=language_hints,
-                    channel_ids=channel_ids,
-                    poll_interval=poll_interval,
-                    timeout=timeout,
-                ),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError as exc:
-            raise AliyunAPIError("百炼文件转写等待超时（已达到墙钟上限）") from exc
+        result = await self.transcribe_file_url_detailed(
+            model=model,
+            file_url=file_url,
+            language_hints=language_hints,
+            channel_ids=channel_ids,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            audio_duration_seconds=audio_duration_seconds,
+            operation=operation,
+        )
+        return result.text
 
     async def transcribe_file_url_detailed(
         self,
@@ -568,12 +781,17 @@ class AliyunModelClient:
         channel_ids: Optional[list[int]] = None,
         poll_interval: float = 2.0,
         timeout: float = 1800.0,
+        audio_duration_seconds: Optional[float] = None,
+        operation: str = "asr_filetrans",
     ) -> TranscriptionResult:
         """Run FileTrans and return text with immutable sentence timestamps."""
         if poll_interval <= 0 or timeout <= 0:
             raise ValueError("poll_interval 和 timeout 必须大于 0")
+        started_at = datetime.now(timezone.utc).isoformat()
+        started_monotonic = time.monotonic()
+        metrics = _RequestMetrics()
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._transcribe_file_url_detailed_impl(
                     model=model,
                     file_url=file_url,
@@ -581,11 +799,58 @@ class AliyunModelClient:
                     channel_ids=channel_ids,
                     poll_interval=poll_interval,
                     timeout=timeout,
+                    metrics=metrics,
                 ),
                 timeout=timeout,
             )
         except asyncio.TimeoutError as exc:
-            raise AliyunAPIError("百炼文件转写等待超时（已达到墙钟上限）") from exc
+            error = AliyunAPIError("百炼文件转写等待超时（已达到墙钟上限）")
+            await self._record_model_call(
+                model=model,
+                operation=operation,
+                api_kind="native_filetrans",
+                status="error",
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                metrics=metrics,
+                audio_seconds=audio_duration_seconds,
+                error=error,
+            )
+            raise error from exc
+        except BaseException as exc:
+            await self._record_model_call(
+                model=model,
+                operation=operation,
+                api_kind="native_filetrans",
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                metrics=metrics,
+                audio_seconds=audio_duration_seconds,
+                error=exc,
+            )
+            raise
+
+        measured_seconds = audio_duration_seconds
+        if measured_seconds is None:
+            timed_ends = [
+                sentence.end_time_ms
+                for sentence in result.sentences
+                if sentence.end_time_ms is not None
+            ]
+            if timed_ends:
+                measured_seconds = max(timed_ends) / 1000.0
+        await self._record_model_call(
+            model=model,
+            operation=operation,
+            api_kind="native_filetrans",
+            status="success",
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            metrics=metrics,
+            audio_seconds=measured_seconds,
+        )
+        return result
 
     async def _transcribe_file_url_impl(
         self,
@@ -596,6 +861,7 @@ class AliyunModelClient:
         channel_ids: Optional[list[int]] = None,
         poll_interval: float = 2.0,
         timeout: float = 1800.0,
+        metrics: Optional[_RequestMetrics] = None,
     ) -> str:
         """Submit a public media URL to native DashScope and await its transcript."""
         result = await self._transcribe_file_url_detailed_impl(
@@ -605,6 +871,7 @@ class AliyunModelClient:
             channel_ids=channel_ids,
             poll_interval=poll_interval,
             timeout=timeout,
+            metrics=metrics,
         )
         return result.text
 
@@ -617,6 +884,7 @@ class AliyunModelClient:
         channel_ids: Optional[list[int]] = None,
         poll_interval: float = 2.0,
         timeout: float = 1800.0,
+        metrics: Optional[_RequestMetrics] = None,
     ) -> TranscriptionResult:
         """Submit a public media URL and await timestamp-preserving FileTrans output."""
         parsed_url = urlparse(file_url)
@@ -638,6 +906,7 @@ class AliyunModelClient:
             },
             extra_headers={"X-DashScope-Async": "enable"},
             retry=False,
+            metrics=metrics,
         )
         output = submit_data.get("output")
         if not isinstance(output, dict):
@@ -645,13 +914,15 @@ class AliyunModelClient:
         task_id = output.get("task_id")
         if not isinstance(task_id, str) or not task_id.strip():
             raise AliyunAPIError("百炼文件转写提交响应缺少 task_id")
+        if metrics is not None:
+            metrics.provider_request_id = task_id.strip()[:256]
 
         max_polls = max(1, math.ceil(timeout / poll_interval))
         task_url = self._native_url(f"tasks/{quote(task_id.strip(), safe='')}")
         transcription_urls: list[str] = []
         last_status = "UNKNOWN"
         for poll_index in range(max_polls):
-            task_data = await self._request_json("GET", task_url)
+            task_data = await self._request_json("GET", task_url, metrics=metrics)
             task_output = task_data.get("output")
             if not isinstance(task_output, dict):
                 raise AliyunAPIError("百炼文件转写任务响应缺少 output")
@@ -678,7 +949,10 @@ class AliyunModelClient:
         transcripts: list[TranscriptionResult] = []
         for result_url in transcription_urls:
             self._validate_transcription_result_url(result_url)
-            result_data = await self._download_transcription_json(result_url)
+            result_data = await self._download_transcription_json(
+                result_url,
+                metrics=metrics,
+            )
             transcripts.append(self._extract_transcription_result(result_data))
         return TranscriptionResult(
             text="\n\n".join(result.text for result in transcripts),
@@ -690,7 +964,9 @@ class AliyunModelClient:
         )
 
 
-aliyun_client = AliyunModelClient()
+aliyun_client = AliyunModelClient(
+    usage_store_factory=get_model_usage_store if MODEL_USAGE_LOG_ENABLED else None
+)
 
 
 async def close_aliyun_client() -> None:
