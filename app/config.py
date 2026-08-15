@@ -33,6 +33,15 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} 必须是 true/false，当前值为 {raw!r}")
+
+
 # 企业微信
 CORP_ID = os.getenv("CORP_ID", "your_corp_id")
 AGENT_ID = _env_int("AGENT_ID", 1000002)
@@ -88,6 +97,8 @@ MCP_PORT = _env_int("MCP_PORT", 8090)
 TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/douyin-bot")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 KNOWLEDGE_DB_PATH = os.getenv("KNOWLEDGE_DB_PATH", str(PROJECT_ROOT / "knowledge.db"))
+MODEL_USAGE_LOG_ENABLED = _env_bool("MODEL_USAGE_LOG_ENABLED", False)
+MODEL_USAGE_DB_PATH = os.getenv("MODEL_USAGE_DB_PATH", KNOWLEDGE_DB_PATH)
 KNOWLEDGE_ASSETS_DIR = os.getenv(
     "KNOWLEDGE_ASSETS_DIR",
     str(Path(KNOWLEDGE_DB_PATH).expanduser().parent / "knowledge_assets"),

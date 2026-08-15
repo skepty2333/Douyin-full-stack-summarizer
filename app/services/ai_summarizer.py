@@ -609,19 +609,23 @@ async def _transcribe_local_audio_detailed(
     try:
         for index, segment in enumerate(segments, start=1):
             await _notify(callback, f"语音转写 {index}/{len(segments)}")
+            try:
+                segment_duration = await _audio_duration(segment)
+                duration_ms = max(1, round(segment_duration * 1000))
+                billing_duration: Optional[float] = segment_duration
+            except Exception as exc:
+                logger.warning(
+                    "无法读取本地 ASR 分段时长，使用配置值近似定位且费用留空: %s",
+                    type(exc).__name__,
+                )
+                billing_duration = None
+                duration_ms = ASR_SEGMENT_SECONDS * 1000
             text = await aliyun_client.transcribe_audio(
                 model=ALIYUN_ASR_FALLBACK_MODEL,
                 audio_path=segment,
                 context=context,
+                audio_duration_seconds=billing_duration,
             )
-            try:
-                duration_ms = max(1, round((await _audio_duration(segment)) * 1000))
-            except Exception as exc:
-                logger.warning(
-                    "无法读取本地 ASR 分段时长，使用配置值近似定位: %s",
-                    type(exc).__name__,
-                )
-                duration_ms = ASR_SEGMENT_SECONDS * 1000
             transcripts.append(text)
             timed_sentences.extend(
                 _approximate_sentences(
@@ -671,17 +675,23 @@ async def _transcribe_audio_detailed(
     video_title: str = "",
     video_author: str = "",
     callback: ProgressCallback = None,
+    duration_seconds: Optional[float] = None,
 ) -> TranscriptionResult:
     """Prefer timestamped FileTrans and degrade to approximate local timing."""
     if media_url:
         try:
+            filetrans_kwargs: dict[str, Any] = {
+                "model": ALIYUN_ASR_MODEL,
+                "file_url": media_url,
+                "language_hints": ["zh", "en"],
+                "channel_ids": [0],
+                "poll_interval": ASR_FILE_POLL_INTERVAL_SECONDS,
+                "timeout": ASR_FILE_TIMEOUT_SECONDS,
+            }
+            if duration_seconds is not None:
+                filetrans_kwargs["audio_duration_seconds"] = duration_seconds
             result = await aliyun_client.transcribe_file_url_detailed(
-                model=ALIYUN_ASR_MODEL,
-                file_url=media_url,
-                language_hints=["zh", "en"],
-                channel_ids=[0],
-                poll_interval=ASR_FILE_POLL_INTERVAL_SECONDS,
-                timeout=ASR_FILE_TIMEOUT_SECONDS,
+                **filetrans_kwargs,
             )
             if result.text.strip():
                 return result
@@ -1001,6 +1011,7 @@ async def _analyze_visual_deltas(
     try:
         raw = await aliyun_client.chat(
             model=ALIYUN_VISUAL_MODEL,
+            operation="visual_analysis",
             messages=[
                 {"role": "system", "content": STAGE1_SYSTEM},
                 {
@@ -1112,6 +1123,7 @@ async def _review_extracted_frames(
     try:
         raw_review = await aliyun_client.chat(
             model=ALIYUN_VISUAL_MODEL,
+            operation="screenshot_review",
             messages=[
                 {"role": "system", "content": SCREENSHOT_REVIEW_SYSTEM},
                 {"role": "user", "content": content},
@@ -1201,6 +1213,7 @@ async def stage1_transcribe_and_analyze(
         video_title=video_title,
         video_author=video_author,
         callback=callback,
+        duration_seconds=duration_seconds,
     )
     segments, timestamp_quality = _normalize_transcript_segments(
         transcription,
@@ -1315,6 +1328,7 @@ async def stage2_deep_research(
     try:
         return await aliyun_client.chat(
             model=ALIYUN_RESEARCH_MODEL,
+            operation="research",
             messages=[
                 {"role": "system", "content": STAGE2_SYSTEM},
                 {"role": "user", "content": user_content},
@@ -1382,6 +1396,7 @@ async def stage3_enrich_and_finalize(
     )
     return await aliyun_client.chat(
         model=ALIYUN_FINAL_MODEL,
+        operation="final_edit",
         messages=[
             {"role": "system", "content": STAGE3_SYSTEM},
             {"role": "user", "content": user_content},
@@ -1412,6 +1427,7 @@ async def summarize_with_artifacts(
         video_title=video_title,
         video_author=video_author,
         callback=progress_callback,
+        duration_seconds=duration_seconds,
     )
     segments, timestamp_quality = _normalize_transcript_segments(
         transcription,
@@ -1514,6 +1530,7 @@ async def generate_tags_with_ai(
     try:
         raw = await aliyun_client.chat(
             model=ALIYUN_TAG_MODEL,
+            operation="tagging",
             messages=[
                 {"role": "system", "content": TAG_SYSTEM_PROMPT},
                 {"role": "user", "content": content},

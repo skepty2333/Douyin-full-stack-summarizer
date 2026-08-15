@@ -293,6 +293,34 @@ ALIYUN_FINAL_MODEL=qwen3.8-max
 - Key、compatible 地址和 native 地址必须来自同一地域、同一 Workspace。
 - 文档和配置模板只能保留占位符，真实 Key 不应提交到 Git 或打印到日志。
 
+### 4.8 模型调用观测与价格快照
+
+观测功能默认关闭；设置 `MODEL_USAGE_LOG_ENABLED=true` 并重启 Bot 后启用。`AliyunModelClient` 在逻辑调用边界统一采集使用量，不由各提示词阶段自行拼日志。Chat Completions、Responses、FileTrans 和本地 ASR 即使失败或取消也各写一条 `model_usage_log`；HTTP 重试累计到该条记录的 `request_count` 与 `retry_count`，不会被当成多次业务调用。FileTrans 的提交、轮询和结果下载仍属于同一个逻辑调用。
+
+每条记录包含：`job_id`、`video_code`、模型名、`operation`、API 类型、状态、UTC 起止时间、耗时、请求/重试数、供应商 request/task ID、HTTP/错误类型、输入/输出/缓存/推理 Token、音频秒数、只含 usage 的原始 JSON、价格版本、币种、费率、估算费用和费用状态。`ContextVar` 会把任务关联信息安全传播到并行创建的 Stage1/Stage2 子任务。日志明确不写入企业微信用户 ID、提示词、逐字稿、研究备忘、终稿、媒体 URL、图片、API Key 或 Authorization 头。
+
+价格版本 `aliyun-cn-beijing-2026-08-15` 固化从[阿里云百炼中国内地计费页面](https://help.aliyun.com/zh/model-studio/model-pricing)与控制台核对的人民币口径。滚动别名与日期快照可能价格不同；这里把 `qwen3.7-plus` 当日限时折扣和日期快照标准价分别登记：
+
+| 模型 | 输入长度 | 输入 / 百万 Token | 缓存输入 / 百万 Token | 输出 / 百万 Token |
+| :--- | :--- | ---: | ---: | ---: |
+| `qwen3.7-flash` | ≤32K | ¥0.2 | ¥0.04 | ¥0.8 |
+| `qwen3.7-flash` | 32K-256K | ¥0.6 | ¥0.12 | ¥2.4 |
+| `qwen3.7-flash` | 256K-1M | ¥1.2 | ¥0.24 | ¥4.8 |
+| `qwen3.7-plus` 滚动别名（当日限时价） | ≤256K | ¥1.6 | ¥0.32 | ¥6.4 |
+| `qwen3.7-plus` 滚动别名（当日限时价） | 256K-1M | ¥4.8 | ¥0.96 | ¥19.2 |
+| `qwen3.7-plus-2026-05-26` | ≤256K | ¥2 | ¥0.4 | ¥8 |
+| `qwen3.7-plus-2026-05-26` | 256K-1M | ¥6 | ¥1.2 | ¥24 |
+| `qwen3.8-max` | ≤1M | ¥12 | ¥1.5 | ¥36 |
+
+`qwen-audio-3.0-asr-flash-filetrans` 与回退 `qwen3-asr-flash` 均按 CNY ¥0.00022/音频秒估算。估算不含内置联网搜索等附加费用，不抵扣免费额度，也不替代百炼账单。服务端缺少 usage、超出已登记价格档位、失败调用收费不明或模型未登记时，`estimated_cost` 为 `NULL` 并由 `cost_status` 说明原因，报表把它计入“费用未知”而不是 0。
+
+启用后，日志库默认与知识库共用 `knowledge.db`，也可用 `MODEL_USAGE_DB_PATH` 分离；`/ready` 仅在启用时检查日志表。每条历史记录固化自己的价格版本、币种和费率，更新代码不会追溯改写旧记录；报表会按币种汇总并显示区间内出现的价格版本。采集关闭时仍可读取已有数据库：
+
+```bash
+venv/bin/python scripts/model_usage_report.py --days 7
+venv/bin/python scripts/model_usage_report.py --days 7 --details --limit 200
+```
+
 ---
 
 ## 5. 稳定性与故障隔离
@@ -462,6 +490,8 @@ chmod 600 .env
 | `JOB_TIMEOUT_SECONDS` | 3600 | 必须覆盖音频提取到文件交付的处理时间。 |
 | `DOWNLOAD_TIMEOUT_SECONDS` | 600 | 限制单个视频解析与下载占用连接和磁盘的时间。 |
 | `TEMP_FILE_TTL_HOURS` | 24 | 根据任务周期和磁盘容量调整。 |
+| `MODEL_USAGE_LOG_ENABLED` | `false` | 设为 `true` 并重启 Bot 后采集新调用；关闭不影响读取已有报表。 |
+| `MODEL_USAGE_DB_PATH` | 与 `KNOWLEDGE_DB_PATH` 相同 | 可指向独立 SQLite；必须位于持久化、可备份且 Bot 可写的位置。 |
 | `KNOWLEDGE_ASSETS_DIR` | 与数据库同级的 `knowledge_assets/` | 必须是受 Bot 与 MCP 共同访问的绝对持久化目录；备份、迁移和容量规划应与 SQLite 同步。 |
 
 ---
@@ -491,6 +521,7 @@ chmod 600 .env
 6. MCP 仍监听 `127.0.0.1`，公网入口具有认证与 TLS。
 7. `KNOWLEDGE_ASSETS_DIR` 为绝对路径、权限受限且磁盘空间充足；备份任务同时覆盖 SQLite 与该目录。
 8. 使用一个包含界面、图表和公式的短视频验证句级时间戳、并行视觉/研究、确定性合并、截图审核、二/三级标题结构、规范图片 URI、内容寻址入库、MCP 按需取图和 PDF 交付。
-9. 日志中没有 Key、Authorization 头、资产绝对路径或完整异常响应。
+9. 如已启用用量观测，运行 `scripts/model_usage_report.py --days 1 --details`，确认七类调用可关联到同一 `job_id`/视频码，Token 或音频时长存在，费用未知项有明确原因。
+10. 日志中没有 Key、Authorization 头、提示词、逐字稿、媒体 URL、资产绝对路径或完整异常响应。
 
 以上设计将模型供应链统一到阿里云百炼，并把 Markdown、图片清单和内容寻址 JPEG 作为可持续读取的多模态知识层；PDF 仅负责交付。任务隔离、容量控制、超时重试、完整性校验、健康检查和最小暴露面共同降低单机运行风险。
