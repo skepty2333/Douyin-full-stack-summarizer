@@ -246,6 +246,17 @@ class DurationPolicyTests(unittest.TestCase):
                 self.assertEqual(sparse.final_thinking_budget, dense.final_thinking_budget)
 
 
+class VisualSamplingPolicyTests(unittest.TestCase):
+    def test_short_videos_preserve_brief_small_visual_evidence(self) -> None:
+        self.assertEqual(ai_summarizer._visual_fps(180), 2.0)
+        self.assertEqual(ai_summarizer._visual_max_pixels(180), 1_310_720)
+        self.assertEqual(ai_summarizer._max_editor_frames(180), 6)
+
+        self.assertEqual(ai_summarizer._visual_fps(181), 1.0)
+        self.assertEqual(ai_summarizer._visual_max_pixels(181), 655_360)
+        self.assertEqual(ai_summarizer._max_editor_frames(451), 8)
+
+
 class VisualDeltaTests(unittest.IsolatedAsyncioTestCase):
     def test_visual_json_is_validated_deduplicated_and_bounded_by_duration(self) -> None:
         segments = _timestamped_segments()
@@ -344,12 +355,49 @@ class VisualDeltaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.annotation_id for item in annotations], ["V0001", "V0002", "V0003"])
         self.assertEqual([item.start_ms for item in annotations], [1_000, 3_000, 8_000])
         self.assertEqual(annotations[0].text, "关键 数字 42")
+        self.assertTrue(annotations[0].editor_frame_recommended)
+        self.assertEqual(annotations[0].editor_frame_ms, 1_100)
         self.assertTrue(annotations[0].screenshot_recommended)
         self.assertEqual(annotations[0].details_md, "- 左列：旧值\n- 右列：新值")
         self.assertFalse(annotations[1].screenshot_recommended)
         self.assertIsNone(annotations[1].screenshot_reason)
         self.assertEqual(annotations[1].anchor_segment_id, "S0001")
         self.assertEqual(annotations[2].anchor_segment_id, "S0002")
+
+    def test_editor_context_frame_does_not_imply_reader_screenshot(self) -> None:
+        raw = json.dumps(
+            {
+                "schema_version": "stage1.visual-delta.v1",
+                "annotations": [
+                    {
+                        "start_ms": 100,
+                        "end_ms": 900,
+                        "anchor_segment_id": "S0001",
+                        "kind": "ocr",
+                        "confidence": "high",
+                        "text": "开头框选文字显示项目名 example-tool",
+                        "novelty_reason": "逐字稿没有说出项目名",
+                        "editor_frame_recommended": True,
+                        "editor_frame_ms": 500,
+                        "screenshot_recommended": False,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+        annotations = ai_summarizer._validated_visual_annotations(
+            raw,
+            _timestamped_segments(),
+            duration_seconds=9,
+        )
+        self.assertEqual(len(annotations), 1)
+        self.assertTrue(annotations[0].editor_frame_recommended)
+        self.assertFalse(annotations[0].screenshot_recommended)
+        self.assertEqual(annotations[0].editor_frame_ms, 500)
+        payload = ai_summarizer._frame_annotation_payload(annotations)
+        self.assertEqual(payload[0]["frame_recommended"], True)
+        self.assertNotIn("screenshot_recommended", payload[0])
 
     def test_malformed_visual_json_is_rejected(self) -> None:
         segments = _timestamped_segments()
@@ -400,6 +448,8 @@ class VisualDeltaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不输出标题、摘要、结论", system_prompt)
         user_parts = kwargs["messages"][1]["content"]
         self.assertEqual(user_parts[0]["type"], "video_url")
+        self.assertEqual(user_parts[0]["fps"], 2.0)
+        self.assertEqual(user_parts[0]["max_pixels"], 1_310_720)
         payload = json.loads(user_parts[1]["text"])
         self.assertEqual(
             [item["text"] for item in payload["transcript_segments"]],
@@ -454,9 +504,19 @@ class Stage3WritingPromptTests(unittest.TestCase):
 
     def test_screenshot_prompts_require_set_level_deduplication(self) -> None:
         self.assertIn("全局去重", ai_summarizer.SCREENSHOT_REVIEW_SYSTEM)
-        self.assertIn("最小非重复图片集合", ai_summarizer.SCREENSHOT_REVIEW_SYSTEM)
-        self.assertIn("同一稳定视觉状态最多推荐一张截图", ai_summarizer.STAGE1_SYSTEM)
+        self.assertIn("最小非重复视觉证据集合", ai_summarizer.SCREENSHOT_REVIEW_SYSTEM)
+        self.assertIn("不能用页面里的另一项信息代替", ai_summarizer.SCREENSHOT_REVIEW_SYSTEM)
+        self.assertIn("同一未变化的信息状态最多推荐一个候选帧", ai_summarizer.STAGE1_SYSTEM)
         self.assertIn("同一二级章节通常最多一张", ai_summarizer.STAGE3_SYSTEM)
+
+    def test_prompts_separate_editor_context_from_reader_display(self) -> None:
+        self.assertIn("检查完整时间轴", ai_summarizer.STAGE1_SYSTEM)
+        self.assertIn("editor_frame_recommended", ai_summarizer.STAGE1_SYSTEM)
+        self.assertIn("分开判断", ai_summarizer.STAGE1_SYSTEM)
+        self.assertIn("互不重叠的关键文字或区域", ai_summarizer.STAGE1_SYSTEM)
+        self.assertIn("不代表必须向读者展示", ai_summarizer.STAGE3_SYSTEM)
+        self.assertIn("通常应直接写成正文、列表、表格或代码块", ai_summarizer.STAGE3_SYSTEM)
+        self.assertIn("关键静态姿态", ai_summarizer.STAGE3_SYSTEM)
 
 
 class ScreenshotReviewTests(unittest.IsolatedAsyncioTestCase):
@@ -499,7 +559,7 @@ class ScreenshotReviewTests(unittest.IsolatedAsyncioTestCase):
                             "decision": "keep",
                             "correspondence": "exact",
                             "readability": "clear",
-                            "article_value": "helpful",
+                            "editor_value": "helpful",
                             "caption": "截图中清楚显示数字 42。",
                             "reason": "文字清晰且补充正文",
                         },
@@ -508,7 +568,7 @@ class ScreenshotReviewTests(unittest.IsolatedAsyncioTestCase):
                             "decision": "reject",
                             "correspondence": "mismatch",
                             "readability": "usable",
-                            "article_value": "decorative",
+                            "editor_value": "decorative",
                             "caption": None,
                             "reason": "截图没有显示所述三栏结构",
                         },
@@ -664,6 +724,73 @@ class StageInputContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("二级标题", system_prompt)
                 self.assertIn("三级标题", system_prompt)
                 self.assertIn("标题—一句话—标题", system_prompt)
+
+    async def test_stage3_receives_reviewed_frame_as_optional_editor_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "video_frame_V0001.jpg"
+            Image.new("RGB", (80, 60), "white").save(path, "JPEG")
+            frame = ExtractedVideoFrame(
+                annotation_id="V0001",
+                timestamp_ms=500,
+                path=path,
+                kind="ocr",
+                confidence="high",
+                caption="框选区域显示项目名 example-tool",
+                quality_score=8.0,
+            )
+            with patch.object(
+                ai_summarizer.aliyun_client,
+                "chat",
+                new_callable=AsyncMock,
+                return_value="最终笔记",
+            ) as chat:
+                result = await ai_summarizer.stage3_enrich_and_finalize(
+                    "完整增强逐字稿",
+                    "<internal_research_memo>无</internal_research_memo>",
+                    source_transcript="完整原始逐字稿",
+                    visual_evidence=(
+                        "- [V0001｜约 00:00-00:01｜ocr｜high｜"
+                        "editor_frame_available=true｜screenshot_hint=false] "
+                        "项目名为 example-tool"
+                    ),
+                    video_frames=(frame,),
+                )
+
+        self.assertEqual(result, "最终笔记")
+        content = chat.await_args.kwargs["messages"][1]["content"]
+        self.assertIsInstance(content, list)
+        payload = json.loads(content[0]["text"])
+        self.assertIn("primary_visual_evidence", payload)
+        frame_context = json.loads(content[1]["text"])
+        self.assertEqual(frame_context["editor_candidate_frame"]["id"], "V0001")
+        self.assertEqual(content[2]["type"], "image_url")
+        self.assertTrue(
+            content[2]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+        )
+
+    async def test_stage3_retries_with_text_if_frame_input_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "video_frame_V0001.jpg"
+            Image.new("RGB", (40, 40), "white").save(path, "JPEG")
+            frame = ExtractedVideoFrame(
+                "V0001", 500, path, "visible_fact", "high", "关键姿态", 8.0
+            )
+            with patch.object(
+                ai_summarizer.aliyun_client,
+                "chat",
+                new_callable=AsyncMock,
+                side_effect=[RuntimeError("multimodal unavailable"), "文字降级终稿"],
+            ) as chat:
+                result = await ai_summarizer.stage3_enrich_and_finalize(
+                    "完整增强逐字稿",
+                    "<internal_research_memo>无</internal_research_memo>",
+                    video_frames=(frame,),
+                )
+
+        self.assertEqual(result, "文字降级终稿")
+        self.assertEqual(chat.await_count, 2)
+        self.assertIsInstance(chat.await_args_list[0].kwargs["messages"][1]["content"], list)
+        self.assertIsInstance(chat.await_args_list[1].kwargs["messages"][1]["content"], str)
 
 
 class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):

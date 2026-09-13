@@ -4,10 +4,20 @@
 通过 Streamable HTTP 或 stdio 向 MCP 客户端提供知识库文字检索和按需取图。
 HTTP 模式默认仅监听 127.0.0.1；远程访问必须经过带认证的 HTTPS
 反向代理、VPN 或受控隧道，不直接暴露 8090 端口。
+
+经隧道/反代远程访问时，需将对外域名加入 DNS rebinding 防护白名单：
+- MCP_ALLOWED_HOSTS：逗号分隔的完整域名（含端口，支持 域名:* 匹配任意端口）
+- MCP_ALLOWED_HOST_SUFFIXES：逗号分隔的后缀通配，如 *.trycloudflare.com（快速隧道）
+浏览器客户端另需配置 MCP_ALLOWED_ORIGINS。
 """
 import logging
 import asyncio
+import os
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.transport_security import (
+    TransportSecurityMiddleware,
+    TransportSecuritySettings,
+)
 from pydantic import BaseModel, Field
 from app.database.knowledge_store import KnowledgeStore
 from app.config import KNOWLEDGE_DB_PATH, MCP_HOST, MCP_PORT
@@ -19,8 +29,48 @@ logger = logging.getLogger("mcp-knowledge")
 store = KnowledgeStore(KNOWLEDGE_DB_PATH)
 
 # 默认只监听本机，并保留 FastMCP 的 DNS rebinding 防护。
-# 如需远程访问，请通过带认证的反向代理或受控隧道暴露。
-mcp = FastMCP("douyin_knowledge_mcp", host=MCP_HOST, port=MCP_PORT)
+# 如需远程访问，请通过带认证的反向代理或受控隧道暴露，
+# 并将对外域名加入 MCP_ALLOWED_HOSTS / MCP_ALLOWED_HOST_SUFFIXES 白名单。
+_default_hosts = [MCP_HOST, f"{MCP_HOST}:{MCP_PORT}"]
+_extra_hosts = [h.strip() for h in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+_extra_origins = [o.strip() for o in os.getenv("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+_host_suffixes = [
+    s.strip()[1:].lower()
+    for s in os.getenv("MCP_ALLOWED_HOST_SUFFIXES", "").split(",")
+    if s.strip().startswith("*.") and len(s.strip()) > 2
+]
+
+
+_orig_validate_host = TransportSecurityMiddleware._validate_host
+
+
+def _validate_host_with_suffix(self, host):
+    """在 SDK 原生校验基础上，额外支持 *.后缀 形式的 Host 通配（如快速隧道随机域名）。"""
+    if _orig_validate_host(self, host):
+        return True
+    # 仅匹配主机名部分（忽略端口），后缀本身不算命中
+    hostname = (host or "").split(":")[0].lower()
+    if any(hostname.endswith(suffix) and hostname != suffix[1:] for suffix in _host_suffixes):
+        return True
+    logger.warning("Invalid Host header: %s", host)
+    return False
+
+
+if _host_suffixes:
+    # SDK 原生白名单只支持完整域名和 域名:* 端口通配，这里通过替换校验方法补充后缀通配能力
+    TransportSecurityMiddleware._validate_host = _validate_host_with_suffix
+
+
+mcp = FastMCP(
+    "douyin_knowledge_mcp",
+    host=MCP_HOST,
+    port=MCP_PORT,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_default_hosts + _extra_hosts,
+        allowed_origins=_extra_origins,
+    ),
+)
 
 
 # ======================== Tool: Search ========================
