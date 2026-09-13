@@ -122,7 +122,9 @@ flowchart TD
 | `app/database/vocabulary.py` | 受控词表：规范条目、别名归一、合并 / 重命名、笔记关联与计数。 |
 | `app/services/note_tagging.py` | 分类与标签调用：domain / temporality / 词表映射的 JSON 输出与校验。 |
 | `scripts/build_note_index.py` | 建立或刷新章节索引的幂等脚本。 |
-| `scripts/seed_vocabulary.py`、`scripts/retag_notes.py`、`scripts/backfill_publish_dates.py` | 种子词表生成、全库重打标签、发布时间回填。 |
+| `app/database/topics.py` | 主题与页面版本：出生、标脏、拆分为枢纽 / 子主题、合并建议、否决。 |
+| `app/services/topic_compiler.py` | 主题页编译：章节取材、引用校验、来源清单、增量重编译、超限拆分。 |
+| `scripts/seed_vocabulary.py`、`scripts/retag_notes.py`、`scripts/backfill_publish_dates.py`、`scripts/grow_topics.py` | 种子词表生成、全库重打标签、发布时间回填、主题整体生长。 |
 | `mcp_server.py` | Streamable HTTP / stdio MCP 服务与 10 个文字/图片知识库工具。 |
 
 视频页面由 `httpx` 直接请求并读取 `_ROUTER_DATA`，项目当前不依赖 `yt-dlp` 完成解析。
@@ -480,13 +482,31 @@ SQLite 使用 WAL 提高读写并存能力。旧的 FTS5 表仍由触发器同�
 
 `kind` 决定条目将来能否长成主题页：只有 topic 与 entity 有资格，内容形式（教程、评测）与空话永远只是标签。合并（`merge`）会把别名与笔记关联搬到目标条目并让旧条目保持可解析；重命名把旧名留作别名。
 
-种子词表由 `scripts/seed_vocabulary.py` 从现有标签一次性聚出（`qwen3.8-max`，`--dry-run` 只看提案，`--from FILE` 载入保存的提案），随后 `scripts/retag_notes.py` 对全部笔记重新分类打标签（默认只处理无词表关联的笔记，`--all` 处理全部）。查询时，命中别名的关键词同时匹配规范名与其余别名（智能体 ↔ Agent ↔ AI Agent），这是关键词通道的同义扩展。标准 Markdown 的时间与 caption 保留在正文 alt 文本中，因此纯文本搜索和不支持图片的客户端仍能理解该视觉证据的基本含义；需要查看原图时再通过 MCP 按需读取。
+种子词表由 `scripts/seed_vocabulary.py` 从现有标签一次性聚出（`qwen3.8-max`，`--dry-run` 只看提案，`--from FILE` 载入保存的提案），随后 `scripts/retag_notes.py` 对全部笔记重新分类打标签（默认只处理无词表关联的笔记，`--all` 处理全部）。查询时，命中别名的关键词同时匹配规范名与其余别名（智能体 ↔ Agent ↔ AI Agent），这是关键词通道的同义扩展。
+
+`note_tags.position` 记录标签在笔记中的次序（分类调用按重要性排序输出）。条目的**主次加权**把前两个位置计 1、其余计 0.5：顺带提及的工具（Docker 在 8 条笔记里全是次要标签）不会因此显得"密集"，而总是作为次要方面出现的横切主题（风险管理在 21 条交易笔记里）仍能积累足够权重。
+
+### 7.3 自动生长的主题页
+
+主题不是人为定义的名单，而是词表条目跨过密度线后自动出生的综述页（`app/database/topics.py`、`app/services/topic_compiler.py`）。笔记始终是证据层，主题页是可重建的派生层：最坏的结果是一页没用的综述，而不是被污染的知识。
+
+| 规则 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| 出生 | 主次加权 ≥ 6 且 ≥ 3 位作者，`kind` 为 topic 或 entity | `TOPIC_MIN_NOTES` / `TOPIC_MIN_AUTHORS`；内容形式与空话永远不出生 |
+| 拆分 | 成员 > 40 条 | `TOPIC_MAX_NOTES`；模型把成员分配到 2–5 个子主题（优先复用已有主题），父页退化为枢纽页（子主题索引 + 各自的一句话定义） |
+| 重编译 | 新增成员 ≥ 3 条 | `TOPIC_RECOMPILE_DIRTY`；新笔记打上标签即把主题标脏，到阈值后在后台重编译，也可随时手动触发 |
+| 合并 | 只建议 | 两个主题成员 Jaccard ≥ 0.5 时在 `list_topics` 中提示，由用户确认 |
+| 否决 | 用户 | 页面保留但不再列出、不再重编译 |
+
+编译输入不是整篇笔记：按主题名与别名从成员笔记里挑最相关的章节（每条最多 3 段、共约 2.6 万字，不做近重复抑制以便每个来源都可被引用；每个成员至少贡献开头一段），再补最多 12 段来自非成员但余弦 ≥ 0.62 的章节作为标签漏打的安全网，附上每条笔记的发布日期与时效类型，以及上一版页面。模型（`TOPIC_COMPILE_MODEL`，默认终稿模型）按固定结构输出：一句话定义、核心结论与主流做法（每条带视频码）、不同来源的分歧（并列而非选边）、可能已过时（带日期）、待验证（材料不支持的内容只能放这里）。"来源笔记"一节由系统按实际用到的笔记生成，模型写的会被替换。增量重编译把上一版页面一并给模型，要求保留未被反驳的结论。每个版本连同来源笔记 ID 保存在 `topic_versions`，可回看任一版本。
+
+2026-09-13 首轮在 252 条笔记上长出 41 个主题（Agent 因 41 条成员被拆为枢纽，子主题复用了 Agent架构 / OpenClaw / 多智能体协作 / Agent记忆 / AI应用落地），全部页面的结论行均有视频码引用。`scripts/grow_topics.py` 做整体生长（`--dry-run` 预览、`--list` 看版图、`--compile 名称` 强制一页）；Bot 在每条笔记索引完成后自动执行同样的出生 / 标脏 / 到阈值重编译。标准 Markdown 的时间与 caption 保留在正文 alt 文本中，因此纯文本搜索和不支持图片的客户端仍能理解该视觉证据的基本含义；需要查看原图时再通过 MCP 按需读取。
 
 ---
 
 ## 8. MCP Server
 
-MCP 服务提供 10 个工具：
+MCP 服务提供 16 个工具：
 
 | 工具 | 参数 | 作用 |
 | :--- | :--- | :--- |
@@ -499,7 +519,13 @@ MCP 服务提供 10 个工具：
 | `get_note_image` | `video_code`, `asset_id` | 解析逻辑引用，校验清单、大小、JPEG 格式和 SHA-256 后返回 MCP `Image`。 |
 | `list_notes` | `limit`, `offset` | 分页列出最近笔记。 |
 | `list_by_tag` | `tag`, `limit` | 按规范标签列出笔记；别名（智能体、龙虾）自动归到规范名，不在词表中的词退回子串匹配。 |
-| `knowledge_stats` | 无 | 查看总笔记数、最新记录、数据库路径、章节索引与词表状态。 |
+| `list_topics` | 无 | 列出自动生长的主题：成员数、状态、版本、待重编译数、枢纽与子主题层级、合并建议。 |
+| `read_topic` | `name`, `version` | 读取主题综述页（名称或别名均可）；条目尚未成为主题时说明原因。 |
+| `compile_topic` | `name` | 立即（重新）编译一页；条目未出生则先出生，成员超限则先拆分。 |
+| `veto_topic` | `name` | 否决主题：页面保留但不再列出、不再重编译。 |
+| `rename_topic` | `name`, `new_name` | 改名，旧名保留为别名。 |
+| `merge_topics` | `source`, `target` | 把一个条目并入另一个：别名与笔记关联迁移，目标主题标记待重编译。 |
+| `knowledge_stats` | 无 | 查看总笔记数、最新记录、数据库路径、章节索引、词表与主题状态。 |
 
 默认配置为：
 
@@ -508,7 +534,7 @@ MCP_HOST=127.0.0.1
 MCP_PORT=8090
 ```
 
-推荐的消费顺序是 `search_notes` 找候选、`collect_sections` 一次读完相关段落、`get_note_by_code` 读整篇；意图路由由 MCP 客户端选择工具完成，服务端不做查询分类。默认 loopback 监听并保留 FastMCP 的 DNS rebinding 防护。多模态客户端先读取笔记文字，只有需要核对某张视觉证据时才调用 `list_note_images` / `get_note_image`，避免在每次检索中传输全部 JPEG。远程客户端应通过带身份认证的 HTTPS 反向代理、VPN 或受控隧道访问，不应把 MCP 端口直接绑定到公网地址。
+推荐的消费顺序是：宽泛问题先 `read_topic`（`search_notes` 的结果尾部会提示相关主题页），要证据时 `collect_sections` 一次读完相关段落，要上下文时 `get_note_by_code` 读整篇；意图路由由 MCP 客户端选择工具完成，服务端不做查询分类。默认 loopback 监听并保留 FastMCP 的 DNS rebinding 防护。多模态客户端先读取笔记文字，只有需要核对某张视觉证据时才调用 `list_note_images` / `get_note_image`，避免在每次检索中传输全部 JPEG。远程客户端应通过带身份认证的 HTTPS 反向代理、VPN 或受控隧道访问，不应把 MCP 端口直接绑定到公网地址。
 
 ---
 
@@ -539,6 +565,9 @@ chmod 600 .env
 | `MODEL_USAGE_LOG_ENABLED` | `false` | 设为 `true` 并重启 Bot 后采集新调用；关闭不影响读取已有报表。 |
 | `MODEL_USAGE_DB_PATH` | 与 `KNOWLEDGE_DB_PATH` 相同 | 可指向独立 SQLite；必须位于持久化、可备份且 Bot 可写的位置。 |
 | `KNOWLEDGE_ASSETS_DIR` | 与数据库同级的 `knowledge_assets/` | 必须是受 Bot 与 MCP 共同访问的绝对持久化目录；备份、迁移和容量规划应与 SQLite 同步。 |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | `text-embedding-v4` / 1024 | 改动后需 `scripts/build_note_index.py` 重新向量化（向量按模型与维度分开存放）。 |
+| `TOPIC_MIN_NOTES` / `TOPIC_MIN_AUTHORS` | 6 / 3 | 主题出生线（主次加权笔记数 / 作者数）；调低会长出更多更薄的页面。 |
+| `TOPIC_MAX_NOTES` / `TOPIC_RECOMPILE_DIRTY` | 40 / 3 | 超限拆分与自动重编译阈值。 |
 
 ---
 

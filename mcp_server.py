@@ -21,8 +21,10 @@ from mcp.server.transport_security import (
 from pydantic import BaseModel, Field
 from app.database.knowledge_store import KnowledgeStore
 from app.database.note_index import NoteIndex, NoteHit
+from app.database.topics import TopicStore
 from app.database.vocabulary import VocabularyStore
 from app.services.aliyun_client import aliyun_client
+from app.services.topic_compiler import TopicCompiler
 from app.config import (
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
@@ -56,6 +58,12 @@ index = NoteIndex(
     embed_fn=_embed_query,
     alias_groups_fn=lambda: vocabulary.alias_groups(),
 )
+
+# 主题：从词表长出来的综述页；编译/否决/改名/合并通过下面的工具进行。
+topics = TopicStore(KNOWLEDGE_DB_PATH, vocabulary=vocabulary)
+topic_compiler = TopicCompiler(store=store, index=index, topics=topics)
+# 同一时间只允许一个编译任务，避免并发写同一主题。
+_compile_lock = asyncio.Lock()
 
 DOMAIN_LABELS = {"ai": "AI", "trading": "交易", "life": "生活", "other": "其他"}
 TEMPORALITY_LABELS = {
@@ -142,11 +150,31 @@ def _format_note_hits(
         )
         section = hit.best_heading or "概述"
         lines.append(f"   ▸ {section} — {hit.best_snippet}")
+    related = _related_topics(hits)  # cheap SQLite read; runs inline
+    if related:
+        lines.append("\n相关主题页（`read_topic`）：" + "、".join(related))
     lines.append(
         "\n> 读相关段落用 `collect_sections`；读整篇用 `get_note_by_code`（视频码）。"
         "标注“版本敏感”的内容绑定具体产品版本，“时效性”的内容是事件或行情，引用时注意发布日期。"
     )
     return "\n".join(lines)
+
+
+def _related_topics(hits: list[NoteHit], *, limit: int = 3) -> list[str]:
+    """Topics whose canonical name appears among the hits' tags, most frequent first."""
+    try:
+        active = {t.name for t in topics.list_topics(statuses=("active",))}
+    except Exception:
+        logger.exception("读取主题列表失败")
+        return []
+    counts: dict[str, int] = {}
+    for hit in hits:
+        for tag in (hit.tags or "").split(","):
+            tag = tag.strip()
+            if tag in active:
+                counts[tag] = counts.get(tag, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [name for name, count in ranked[:limit] if count >= 2]
 
 
 def _index_ready() -> bool:
@@ -480,6 +508,164 @@ async def list_by_tag(params: TagFilterInput) -> str:
     return "\n".join(lines)
 
 
+# ======================== Tools: Topics ========================
+
+def _topic_line(t, *, indent: str = "") -> str:
+    state = {"candidate": "候选", "active": "有效", "archived": "已否决"}.get(t.status, t.status)
+    bits = [f"{t.note_count} 条 / {t.author_count} 位作者", state]
+    if t.is_hub:
+        bits.append("枢纽")
+    if t.latest_version:
+        bits.append(f"v{t.latest_version} · {t.compiled_at[:10]}")
+    else:
+        bits.append("未编译")
+    if t.dirty:
+        bits.append(f"新增 {t.dirty} 条待重编")
+    return f"{indent}- **{t.name}** — " + " · ".join(bits)
+
+
+@mcp.tool(name="list_topics")
+async def list_topics() -> str:
+    """列出自动生长出的主题（综述页）：成员数、状态、版本、是否有新笔记待重编译，以及合并建议。"""
+    rows = await asyncio.to_thread(topics.list_topics)
+    if not rows:
+        return "还没有主题。主题在某个规范标签聚集到足够多的笔记与作者后自动出生。"
+    by_id = {t.id: t for t in rows}
+    roots = [t for t in rows if t.parent_id not in by_id]
+    lines = [f"## 主题（{len(rows)} 个）\n"]
+    for t in sorted(roots, key=lambda t: -t.note_count):
+        lines.append(_topic_line(t))
+        for child in sorted((c for c in rows if c.parent_id == t.id), key=lambda c: -c.note_count):
+            lines.append(_topic_line(child, indent="  "))
+    suggestions = await asyncio.to_thread(topics.merge_suggestions)
+    if suggestions:
+        lines.append("\n### 建议合并（成员高度重叠，需你确认）")
+        for s in suggestions:
+            lines.append(f"- {s.topic_a.name} ↔ {s.topic_b.name}（重叠 {s.overlap:.0%}）")
+    lines.append(
+        "\n> `read_topic` 读页面；`compile_topic` 立即重编译；`veto_topic` 否决；`rename_topic` / `merge_topics` 整理。"
+    )
+    return "\n".join(lines)
+
+
+class ReadTopicInput(BaseModel):
+    name: str = Field(..., min_length=1, max_length=60, description="主题名或其别名（如 智能体 → Agent）")
+    version: int = Field(default=0, ge=0, description="读取某个历史版本；0 表示最新")
+
+
+@mcp.tool(name="read_topic")
+async def read_topic(params: ReadTopicInput) -> str:
+    """读取主题综述页：一句话定义、核心结论（每条带视频码）、不同来源的分歧、可能已过时、待验证、来源笔记。"""
+    topic = await asyncio.to_thread(topics.resolve, params.name)
+    if topic is None:
+        entry = await asyncio.to_thread(vocabulary.resolve, params.name)
+        if entry is not None:
+            return (
+                f"“{entry.canonical}”还不是主题（{entry.note_count} 条笔记 / {entry.author_count} 位作者，"
+                f"主次加权 {entry.weight:g}）。可用 `list_by_tag` 直接看这些笔记，或用 `compile_topic` 强制生成。"
+            )
+        return f"未知主题: {params.name}"
+    version = await asyncio.to_thread(topics.version, topic.id, params.version or None)
+    if version is None:
+        return f"主题 {topic.name} 尚未编译（{topic.reason}）。可用 `compile_topic` 生成。"
+    header = (
+        f"<!-- 主题 {topic.name} · v{version.version} · 编译于 {version.valid_as_of} · "
+        f"来源 {version.notes_count} 条 · 模型 {version.compiled_by}"
+        + (f" · 另有 {topic.dirty} 条新笔记未纳入" if topic.dirty else "")
+        + " -->\n\n"
+    )
+    return header + version.markdown
+
+
+class TopicNameInput(BaseModel):
+    name: str = Field(..., min_length=1, max_length=60, description="主题名或别名")
+
+
+@mcp.tool(name="compile_topic")
+async def compile_topic(params: TopicNameInput) -> str:
+    """立即（重新）编译一个主题页；若该词表条目还不是主题，会先让它出生。成员超过上限时先拆分为子主题。"""
+    entry = await asyncio.to_thread(vocabulary.resolve, params.name)
+    if entry is None:
+        return f"未知主题或标签: {params.name}"
+    if entry.kind not in ("topic", "entity"):
+        return f"“{entry.canonical}”是{entry.kind}，不能成为主题。"
+    async with _compile_lock:
+        topic = await asyncio.to_thread(topics.get_by_vocabulary, entry.id)
+        if topic is None:
+            topic = await asyncio.to_thread(topics.born, entry, reason="手动编译")
+        notes = []
+        if topics.needs_split(topic):
+            split = await topic_compiler.split(topic)
+            notes.append(f"已拆分为子主题：{', '.join(c.name for c in split.children)}")
+            for child in split.children:
+                if child.latest_version == 0:
+                    await topic_compiler.compile(child)
+            topic = await asyncio.to_thread(topics.get, topic.id)
+        result = await topic_compiler.compile(topic)
+    summary = (
+        f"已编译 **{result.topic.name}** v{result.version.version}：来源 {result.member_notes} 条成员笔记"
+        + (f" + {result.outside_notes} 条相关笔记" if result.outside_notes else "")
+        + (f"；{result.uncited_lines} 条结论未标来源" if result.uncited_lines else "")
+        + "。"
+    )
+    return "\n".join([summary, *notes, "", result.version.markdown])
+
+
+@mcp.tool(name="veto_topic")
+async def veto_topic(params: TopicNameInput) -> str:
+    """否决一个主题：页面保留但不再列出、不再重编译；标签本身不受影响。"""
+    topic = await asyncio.to_thread(topics.resolve, params.name)
+    if topic is None:
+        return f"未知主题: {params.name}"
+    await asyncio.to_thread(topics.set_status, topic.id, "archived")
+    return f"已否决主题 {topic.name}（历史版本保留，可用 `compile_topic` 恢复）。"
+
+
+class RenameTopicInput(BaseModel):
+    name: str = Field(..., min_length=1, max_length=60, description="当前主题名或别名")
+    new_name: str = Field(..., min_length=2, max_length=40, description="新的规范名；旧名自动成为别名")
+
+
+@mcp.tool(name="rename_topic")
+async def rename_topic(params: RenameTopicInput) -> str:
+    """给主题（及其词表条目）改名，旧名保留为别名。"""
+    entry = await asyncio.to_thread(vocabulary.resolve, params.name)
+    if entry is None:
+        return f"未知主题或标签: {params.name}"
+    try:
+        renamed = await asyncio.to_thread(vocabulary.rename, entry.id, params.new_name)
+    except ValueError as exc:
+        return f"改名失败：{exc}"
+    return f"已改名：{entry.canonical} → {renamed.canonical}（别名：{' / '.join(renamed.aliases) or '无'}）。"
+
+
+class MergeTopicsInput(BaseModel):
+    source: str = Field(..., min_length=1, max_length=60, description="要并入的主题/标签名")
+    target: str = Field(..., min_length=1, max_length=60, description="合并后保留的主题/标签名")
+
+
+@mcp.tool(name="merge_topics")
+async def merge_topics(params: MergeTopicsInput) -> str:
+    """把一个主题（词表条目）并入另一个：别名和笔记关联迁移，旧名仍可解析；目标主题标记待重编译。"""
+    source = await asyncio.to_thread(vocabulary.resolve, params.source)
+    target = await asyncio.to_thread(vocabulary.resolve, params.target)
+    if source is None or target is None:
+        return "未知主题或标签。"
+    if source.id == target.id:
+        return "两者已是同一条目。"
+    merged = await asyncio.to_thread(vocabulary.merge, source.id, target.id)
+    source_topic = await asyncio.to_thread(topics.get_by_vocabulary, source.id)
+    if source_topic is not None:
+        await asyncio.to_thread(topics.set_status, source_topic.id, "archived")
+    target_topic = await asyncio.to_thread(topics.get_by_vocabulary, target.id)
+    if target_topic is not None:
+        await asyncio.to_thread(topics.mark_dirty, target_topic.id, source.note_count)
+    return (
+        f"已合并：{source.canonical} → {merged.canonical}（现有 {merged.note_count} 条笔记）。"
+        + ("目标主题已标记待重编译，`compile_topic` 可立即纳入新成员。" if target_topic else "")
+    )
+
+
 # ======================== Tool: Stats ========================
 
 @mcp.tool(name="knowledge_stats")
@@ -508,6 +694,14 @@ async def knowledge_stats() -> str:
         )
     except Exception:
         logger.exception("读取词表状态失败")
+    try:
+        t = await asyncio.to_thread(topics.stats)
+        text += (
+            f"- **主题**: 有效 {t['active']} · 候选 {t['candidate']} · 已否决 {t['archived']} · "
+            f"待重编译 {t['dirty']} · 页面版本 {t['versions']}\n"
+        )
+    except Exception:
+        logger.exception("读取主题状态失败")
     return text
 
 

@@ -37,6 +37,9 @@ class VocabEntry:
     source: str = "ai"
     note_count: int = 0
     author_count: int = 0
+    # Membership weight: a tag in a note's first two positions counts 1.0, later
+    # ones 0.5, so incidental mentions do not make an entry look dense.
+    weight: float = 0.0
 
 
 def normalize_name(name: str) -> str:
@@ -97,13 +100,24 @@ class VocabularyStore:
                 CREATE INDEX IF NOT EXISTS idx_note_tags_vocab ON note_tags(vocabulary_id);
                 """
             )
+            columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(note_tags)")}
+            if "position" not in columns:
+                conn.execute("ALTER TABLE note_tags ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
+                # Existing links were inserted in tag order, so rowid order is position.
+                conn.execute(
+                    """UPDATE note_tags SET position = (
+                           SELECT COUNT(*) FROM note_tags t2
+                           WHERE t2.knowledge_id = note_tags.knowledge_id AND t2.rowid < note_tags.rowid)"""
+                )
             conn.commit()
         finally:
             conn.close()
 
     # ----------------------------------------------------------------- read
     @staticmethod
-    def _entry_from_row(row: sqlite3.Row, aliases: Sequence[str], counts: tuple[int, int]) -> VocabEntry:
+    def _entry_from_row(
+        row: sqlite3.Row, aliases: Sequence[str], counts: tuple[int, int, float]
+    ) -> VocabEntry:
         return VocabEntry(
             id=int(row["id"]),
             canonical=str(row["canonical"]),
@@ -114,6 +128,7 @@ class VocabularyStore:
             source=str(row["source"]),
             note_count=counts[0],
             author_count=counts[1],
+            weight=counts[2],
         )
 
     def _aliases_by_entry(self, conn: sqlite3.Connection) -> dict[int, list[str]]:
@@ -124,14 +139,15 @@ class VocabularyStore:
             grouped.setdefault(int(row["vocabulary_id"]), []).append(str(row["alias"]))
         return grouped
 
-    def _counts_by_entry(self, conn: sqlite3.Connection) -> dict[int, tuple[int, int]]:
-        counts: dict[int, tuple[int, int]] = {}
+    def _counts_by_entry(self, conn: sqlite3.Connection) -> dict[int, tuple[int, int, float]]:
+        counts: dict[int, tuple[int, int, float]] = {}
         for row in conn.execute(
-            """SELECT t.vocabulary_id AS v, COUNT(*) AS notes, COUNT(DISTINCT k.author) AS authors
+            """SELECT t.vocabulary_id AS v, COUNT(*) AS notes, COUNT(DISTINCT k.author) AS authors,
+                      SUM(CASE WHEN t.position < 2 THEN 1.0 ELSE 0.5 END) AS weight
                FROM note_tags t JOIN knowledge k ON k.id = t.knowledge_id
                GROUP BY t.vocabulary_id"""
         ):
-            counts[int(row["v"])] = (int(row["notes"]), int(row["authors"]))
+            counts[int(row["v"])] = (int(row["notes"]), int(row["authors"]), float(row["weight"] or 0.0))
         return counts
 
     def list_entries(self, *, active_only: bool = True) -> list[VocabEntry]:
@@ -147,7 +163,7 @@ class VocabularyStore:
             for row in conn.execute(sql):
                 entry_id = int(row["id"])
                 own = [a for a in aliases.get(entry_id, []) if normalize_name(a) != normalize_name(row["canonical"])]
-                entries.append(self._entry_from_row(row, own, counts.get(entry_id, (0, 0))))
+                entries.append(self._entry_from_row(row, own, counts.get(entry_id, (0, 0, 0.0))))
             return entries
         finally:
             conn.close()
@@ -166,7 +182,7 @@ class VocabularyStore:
                 )
                 if normalize_name(r["alias"]) != normalize_name(row["canonical"])
             ]
-            counts = self._counts_by_entry(conn).get(entry_id, (0, 0))
+            counts = self._counts_by_entry(conn).get(entry_id, (0, 0, 0.0))
             return self._entry_from_row(row, aliases, counts)
         finally:
             conn.close()
@@ -315,8 +331,8 @@ class VocabularyStore:
                 (into_id, from_id),
             )
             conn.execute(
-                """INSERT OR IGNORE INTO note_tags (knowledge_id, vocabulary_id, source, created_at)
-                   SELECT knowledge_id, ?, source, created_at FROM note_tags WHERE vocabulary_id = ?""",
+                """INSERT OR IGNORE INTO note_tags (knowledge_id, vocabulary_id, source, created_at, position)
+                   SELECT knowledge_id, ?, source, created_at, position FROM note_tags WHERE vocabulary_id = ?""",
                 (into_id, from_id),
             )
             conn.execute("DELETE FROM note_tags WHERE vocabulary_id = ?", (from_id,))
@@ -367,8 +383,9 @@ class VocabularyStore:
         try:
             conn.execute("DELETE FROM note_tags WHERE knowledge_id = ?", (knowledge_id,))
             conn.executemany(
-                "INSERT OR IGNORE INTO note_tags (knowledge_id, vocabulary_id, source, created_at) VALUES (?, ?, ?, ?)",
-                [(knowledge_id, entry_id, source, now) for entry_id in ids],
+                """INSERT OR IGNORE INTO note_tags (knowledge_id, vocabulary_id, source, created_at, position)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [(knowledge_id, entry_id, source, now, position) for position, entry_id in enumerate(ids)],
             )
             conn.commit()
             return len(ids)
@@ -381,7 +398,7 @@ class VocabularyStore:
             ids = [
                 int(row["vocabulary_id"])
                 for row in conn.execute(
-                    "SELECT vocabulary_id FROM note_tags WHERE knowledge_id = ? ORDER BY rowid",
+                    "SELECT vocabulary_id FROM note_tags WHERE knowledge_id = ? ORDER BY position, rowid",
                     (knowledge_id,),
                 )
             ]

@@ -53,8 +53,10 @@ from app.services.video_frames import (
 )
 from app.database.knowledge_store import KnowledgeAsset, KnowledgeStore, KnowledgeEntry
 from app.database.note_index import NoteIndex
+from app.database.topics import TopicStore
 from app.database.vocabulary import VocabularyStore
 from app.services.note_tagging import classify_note, link_note_tags, resolve_tags
+from app.services.topic_compiler import TopicCompiler
 from app.database.model_usage_store import (
     bind_model_usage_context,
     get_model_usage_store,
@@ -86,10 +88,14 @@ async def _embed_for_index(texts):
     )
 
 
-# 章节级检索索引：笔记入库后在后台切分并向量化，失败不影响交付。
-note_index = NoteIndex(embed_fn=_embed_for_index)
 # 受控词表：标签调用把笔记映射到规范条目，新条目只在词表确实没有时创建。
 vocabulary = VocabularyStore()
+# 章节级检索索引：笔记入库后在后台切分并向量化，失败不影响交付。
+note_index = NoteIndex(embed_fn=_embed_for_index, alias_groups_fn=vocabulary.alias_groups)
+# 主题：入库后在后台让主题出生 / 标脏 / 到阈值重编译；任何失败都不影响交付。
+topic_store = TopicStore(vocabulary=vocabulary)
+topic_compiler = TopicCompiler(store=knowledge_db, index=note_index, topics=topic_store)
+_topic_lock = asyncio.Lock()
 
 
 async def _index_note_in_background(entry_id: int) -> None:
@@ -101,6 +107,34 @@ async def _index_note_in_background(entry_id: int) -> None:
         )
     except Exception:
         logger.exception("章节索引失败: note=%s（可用 scripts/build_note_index.py 补齐）", entry_id)
+        return
+    await _grow_topics_after_note(entry_id)
+
+
+async def _grow_topics_after_note(entry_id: int) -> None:
+    """Runs after indexing: births, dirty marks, and due recompiles for one note."""
+    async with _topic_lock:
+        try:
+            for entry in await asyncio.to_thread(topic_store.eligible_entries):
+                topic = await asyncio.to_thread(topic_store.born, entry)
+                logger.info("主题出生: %s（%s）", topic.name, topic.reason)
+            due = await asyncio.to_thread(topic_store.note_tagged, entry_id)
+            pending = {t.id: t for t in due}
+            for topic in await asyncio.to_thread(topic_store.list_topics):
+                if topic.latest_version == 0 and not topic.is_hub:
+                    pending.setdefault(topic.id, topic)
+            for topic in pending.values():
+                if topic_store.needs_split(topic):
+                    split = await topic_compiler.split(topic)
+                    logger.info("主题拆分: %s → %s", topic.name, [c.name for c in split.children])
+                    for child in split.children:
+                        if child.latest_version == 0:
+                            await topic_compiler.compile(child)
+                    topic = await asyncio.to_thread(topic_store.get, topic.id) or topic
+                result = await topic_compiler.compile(topic)
+                logger.info("主题编译: %s v%s", result.topic.name, result.version.version)
+        except Exception:
+            logger.exception("主题生长失败: note=%s（可用 scripts/grow_topics.py 重试）", entry_id)
 
 
 async def _catch_up_note_index() -> None:

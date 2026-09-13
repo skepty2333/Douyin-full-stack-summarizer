@@ -156,6 +156,7 @@ DASHSCOPE_NATIVE_BASE_URL=https://YOUR_WORKSPACE_ID.cn-beijing.maas.aliyuncs.com
 | 用量观测 | `MODEL_USAGE_LOG_ENABLED`、`MODEL_USAGE_DB_PATH` |
 | 数据与服务 | `TEMP_DIR`、`TEMP_FILE_TTL_HOURS`、`KNOWLEDGE_DB_PATH`、`KNOWLEDGE_ASSETS_DIR`、`SERVER_HOST`、`SERVER_PORT`、`MCP_HOST`、`MCP_PORT` |
 | 章节检索索引 | `EMBEDDING_MODEL`（默认 `text-embedding-v4`）、`EMBEDDING_DIMENSIONS`（默认 1024）、`EMBEDDING_BATCH_SIZE`（默认 10） |
+| 主题生长 | `TOPIC_COMPILE_MODEL`（默认同终稿模型）、`TOPIC_MIN_NOTES`（6）、`TOPIC_MIN_AUTHORS`（3）、`TOPIC_MAX_NOTES`（40）、`TOPIC_RECOMPILE_DIRTY`（3） |
 
 新部署默认让 Bot 和 MCP 都只监听 loopback，由反向代理承担 TLS 与公网边界。只有在已经具备安全组、防火墙或其他受控网络边界时，才应显式改为其他监听地址。
 
@@ -214,9 +215,11 @@ journalctl -u douyin-bot -u douyin-mcp -f
 | `get_note_image` | 按视频码和截图 ID 校验并返回单张 JPEG |
 | `list_notes` | 分页列出最近笔记 |
 | `list_by_tag` | 按规范标签列出笔记，别名自动归一（智能体 → Agent，龙虾 → OpenClaw） |
+| `list_topics` / `read_topic` | 自动生长的主题综述页：每条结论带视频码，分歧并列、过时内容带日期、材料不支持的内容进"待验证" |
+| `compile_topic` / `veto_topic` / `rename_topic` / `merge_topics` | 立即重编译、否决、改名、合并——用户只保留否决与整理权，主题本身自动出生 |
 | `knowledge_stats` | 查看知识库统计 |
 
-推荐调用顺序：`search_notes` 找到候选 → `collect_sections` 一次读完所有相关段落 → 需要上下文时 `get_note_by_code` 读整篇。章节索引是派生数据，首次部署或升级后运行 `venv/bin/python scripts/build_note_index.py` 建立；此后 Bot 在每条笔记入库后自动切分并向量化，索引未建立时搜索自动退回旧版匹配。标签走受控词表：`scripts/seed_vocabulary.py` 从现有标签聚出种子词表，`scripts/retag_notes.py` 为笔记补分类（领域、时效）与规范标签，`scripts/backfill_publish_dates.py` 回填旧笔记的抖音发布时间。多模态客户端应先读取 Markdown，只在需要核对视觉证据时调用 `list_note_images` 和 `get_note_image`，避免每次检索传输全部图片。MCP 自身不提供公网身份认证；远程访问应保持 `MCP_HOST=127.0.0.1`，通过带认证的 HTTPS 反向代理、VPN 或 SSH 隧道接入。
+推荐调用顺序：`search_notes` 找到候选 → `collect_sections` 一次读完所有相关段落 → 需要上下文时 `get_note_by_code` 读整篇。章节索引是派生数据，首次部署或升级后运行 `venv/bin/python scripts/build_note_index.py` 建立；此后 Bot 在每条笔记入库后自动切分并向量化，索引未建立时搜索自动退回旧版匹配。标签走受控词表：`scripts/seed_vocabulary.py` 从现有标签聚出种子词表，`scripts/retag_notes.py` 为笔记补分类（领域、时效）与规范标签，`scripts/backfill_publish_dates.py` 回填旧笔记的抖音发布时间。主题页从词表自动长出：某个规范标签聚集到足够多的笔记与作者后出生并编译，新笔记累积到阈值后重编译，超过上限拆成子主题；`scripts/grow_topics.py` 做整体生长，Bot 在每条笔记入库后自动执行同样的逻辑。多模态客户端应先读取 Markdown，只在需要核对视觉证据时调用 `list_note_images` 和 `get_note_image`，避免每次检索传输全部图片。MCP 自身不提供公网身份认证；远程访问应保持 `MCP_HOST=127.0.0.1`，通过带认证的 HTTPS 反向代理、VPN 或 SSH 隧道接入。
 
 ## 数据与备份
 

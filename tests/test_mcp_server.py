@@ -11,7 +11,9 @@ import unittest
 import mcp_server
 from app.database.knowledge_store import KnowledgeAsset, KnowledgeEntry, KnowledgeStore
 from app.database.note_index import NoteIndex
+from app.database.topics import TopicStore
 from app.database.vocabulary import VocabularyStore
+from app.services.topic_compiler import TopicCompiler
 
 
 VOCAB = ["记忆", "止损", "咖啡"]
@@ -110,8 +112,17 @@ class MCPSearchToolTests(unittest.TestCase):
             model="toy",
             dimensions=len(VOCAB),
         )
-        self.original = (mcp_server.store, mcp_server.index, mcp_server.vocabulary)
+        self.topics = TopicStore(db_path, vocabulary=self.vocab)
+
+        async def fake_chat(*, system, user, max_tokens, operation, thinking_budget):
+            return "# 页面\n\n> 定义。\n\n## 核心结论与主流做法\n\n- 结论 [mem01]\n\n## 不同来源的分歧\n\n暂无\n\n## 可能已过时\n\n暂无\n\n## 待验证\n\n暂无\n"
+
+        self.compiler = TopicCompiler(store=self.store, index=self.index, topics=self.topics, chat_fn=fake_chat, model="fake")
+        self.original = (
+            mcp_server.store, mcp_server.index, mcp_server.vocabulary, mcp_server.topics, mcp_server.topic_compiler,
+        )
         mcp_server.store, mcp_server.index, mcp_server.vocabulary = self.store, self.index, self.vocab
+        mcp_server.topics, mcp_server.topic_compiler = self.topics, self.compiler
         notes = (
             (
                 "mem01",
@@ -149,7 +160,9 @@ class MCPSearchToolTests(unittest.TestCase):
         self.vocab.set_note_tags(self.note_ids["mem01"], [agent.id])
 
     def tearDown(self) -> None:
-        mcp_server.store, mcp_server.index, mcp_server.vocabulary = self.original
+        (
+            mcp_server.store, mcp_server.index, mcp_server.vocabulary, mcp_server.topics, mcp_server.topic_compiler,
+        ) = self.original
         self.temp_dir.cleanup()
 
     def _build_index(self) -> None:
@@ -230,6 +243,29 @@ class MCPSearchToolTests(unittest.TestCase):
         self.assertIn("**发布时间**: 2025-12-02", text)
         self.assertIn("**领域 / 时效**: 交易", text)
 
+    def test_topic_tools_compile_read_list_and_veto(self) -> None:
+        self._build_index()
+        empty = asyncio.run(mcp_server.list_topics())
+        self.assertIn("还没有主题", empty)
+        not_yet = asyncio.run(mcp_server.read_topic(mcp_server.ReadTopicInput(name="智能体")))
+        self.assertIn("还不是主题", not_yet)
+        compiled = asyncio.run(mcp_server.compile_topic(mcp_server.TopicNameInput(name="智能体")))
+        self.assertIn("已编译 **Agent** v1", compiled)
+        self.assertIn("## 来源笔记", compiled)
+        self.assertIn("`mem01`", compiled)
+        page = asyncio.run(mcp_server.read_topic(mcp_server.ReadTopicInput(name="Agent")))
+        self.assertIn("<!-- 主题 Agent · v1", page)
+        listing = asyncio.run(mcp_server.list_topics())
+        self.assertIn("**Agent** — 1 条 / 1 位作者 · 有效 · v1", listing)
+        search = asyncio.run(mcp_server.search_notes(mcp_server.SearchInput(query="记忆", limit=3)))
+        self.assertNotIn("相关主题页", search)  # only one hit carries the tag (needs >= 2)
+        vetoed = asyncio.run(mcp_server.veto_topic(mcp_server.TopicNameInput(name="Agent")))
+        self.assertIn("已否决", vetoed)
+        self.assertIn("还没有主题", asyncio.run(mcp_server.list_topics()))
+        renamed = asyncio.run(mcp_server.rename_topic(mcp_server.RenameTopicInput(name="Agent", new_name="智能体系统")))
+        self.assertIn("Agent → 智能体系统", renamed)
+        self.assertIsNotNone(self.vocab.resolve("agent"))
+
     def test_stats_reports_index_state(self) -> None:
         self._build_index()
         text = asyncio.run(mcp_server.knowledge_stats())
@@ -237,6 +273,7 @@ class MCPSearchToolTests(unittest.TestCase):
         self.assertIn("章节索引", text)
         self.assertIn("待向量化 0", text)
         self.assertIn("**词表**: 1 个规范条目", text)
+        self.assertIn("**主题**: 有效 0", text)
 
 
 if __name__ == "__main__":

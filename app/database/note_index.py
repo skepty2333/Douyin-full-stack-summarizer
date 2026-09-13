@@ -525,8 +525,11 @@ class NoteIndex:
         chunk_terms: dict[int, tuple[float, set[str]]] = {}
         for index, row in enumerate(rows):
             haystack = haystacks[index]
-            title = row.title.lower()
-            tags = row.tags.lower()
+            # Title and tag matches describe the whole note; they are credited to
+            # its opening section only, so body sections rank on their own text.
+            note_level = row.chunk_index == 0
+            title = row.title.lower() if note_level else ""
+            tags = row.tags.lower() if note_level else ""
             score = 0.0
             found: set[str] = set()
             for term in terms:
@@ -536,10 +539,10 @@ class NoteIndex:
                 if any(v in haystack for v in spellings):
                     score += weight
                     hit = True
-                if any(v in title for v in spellings):
+                if title and any(v in title for v in spellings):
                     score += 0.5 * weight
                     hit = True
-                if any(v in tags for v in spellings):
+                if tags and any(v in tags for v in spellings):
                     score += 0.5 * weight
                     hit = True
                 if hit:
@@ -679,11 +682,23 @@ class NoteIndex:
         max_sections: int = 40,
         require_all_terms: bool = False,
         domain: Optional[str] = None,
+        note_ids: Optional[Sequence[int]] = None,
+        exclude_note_ids: Optional[Sequence[int]] = None,
+        min_cosine: Optional[float] = None,
+        dedupe: bool = True,
     ) -> CollectResult:
-        """Pick diverse, relevant sections up to a character budget."""
+        """Pick diverse, relevant sections up to a character budget.
+
+        ``note_ids`` restricts to member notes (topic compilation), while
+        ``exclude_note_ids`` with ``min_cosine`` finds strong outside matches.
+        ``dedupe=False`` keeps near-identical sections from different notes,
+        which a synthesis needs so every source stays citable.
+        """
         hits, cache, semantic_ok, _ = await self._fused_chunks(
             query, require_all_terms=require_all_terms, domain=domain
         )
+        allowed = {int(i) for i in note_ids} if note_ids is not None else None
+        excluded = {int(i) for i in exclude_note_ids} if exclude_note_ids else set()
         selected: list[CollectedSection] = []
         selected_vectors: list[np.ndarray] = []
         per_note: dict[int, int] = {}
@@ -692,6 +707,12 @@ class NoteIndex:
             if len(selected) >= max_sections:
                 break
             row = hit.chunk
+            if allowed is not None and row.knowledge_id not in allowed:
+                continue
+            if row.knowledge_id in excluded:
+                continue
+            if min_cosine is not None and (hit.cosine is None or hit.cosine < min_cosine):
+                continue
             if per_note.get(row.knowledge_id, 0) >= max_per_note:
                 continue
             size = len(row.text)
@@ -702,7 +723,7 @@ class NoteIndex:
                 position = cache.row_to_vector.get(cache.positions[row.chunk_id])
                 if position is not None:
                     vector = cache.matrix[position]
-            if vector is not None and selected_vectors:
+            if dedupe and vector is not None and selected_vectors:
                 if max(float(vector @ other) for other in selected_vectors) >= NEAR_DUPLICATE_COSINE:
                     continue
             selected.append(CollectedSection(chunk=row, score=hit.score))
@@ -718,6 +739,11 @@ class NoteIndex:
             note_count=len(per_note),
             semantic_available=semantic_ok,
         )
+
+    def note_chunks(self, knowledge_id: int) -> list[ChunkRow]:
+        """All chunks of one note in document order (from the cached index)."""
+        cache = self._load()
+        return [row for row in cache.rows if row.knowledge_id == int(knowledge_id)]
 
     # ---------------------------------------------------------------- stats
     def stats(self) -> dict:

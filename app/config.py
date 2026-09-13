@@ -85,6 +85,13 @@ EMBEDDING_DIMENSIONS = _env_int("EMBEDDING_DIMENSIONS", 1024, 64)
 # 兼容接口单次最多接受的文本条数；超过会被服务端拒绝。
 EMBEDDING_BATCH_SIZE = _env_int("EMBEDDING_BATCH_SIZE", 10)
 
+# 主题页：词表条目达到密度即自动出生；页面由终稿模型从章节编译。
+TOPIC_COMPILE_MODEL = os.getenv("TOPIC_COMPILE_MODEL", ALIYUN_FINAL_MODEL)
+TOPIC_MIN_NOTES = _env_int("TOPIC_MIN_NOTES", 6, 2)          # 出生下限：成员笔记的主次加权和（前两个标签计 1，其余计 0.5）
+TOPIC_MIN_AUTHORS = _env_int("TOPIC_MIN_AUTHORS", 3, 1)      # 出生下限：至少几位作者
+TOPIC_MAX_NOTES = _env_int("TOPIC_MAX_NOTES", 40, 10)        # 超过则拆分为子主题、父页退化为枢纽
+TOPIC_RECOMPILE_DIRTY = _env_int("TOPIC_RECOMPILE_DIRTY", 3)  # 新增几条成员笔记后自动重编译
+
 AI_REQUEST_TIMEOUT_SECONDS = _env_float("AI_REQUEST_TIMEOUT_SECONDS", 240.0, 1.0)
 AI_MAX_RETRIES = _env_int("AI_MAX_RETRIES", 3, 0)
 AI_MAX_CONCURRENCY = _env_int("AI_MAX_CONCURRENCY", 3)

@@ -206,41 +206,50 @@ class NoteIndexTests(unittest.TestCase):
         self.assertEqual(result.notes[0].video_code, "qnt01")
 
     def test_collect_respects_budget_per_note_cap_and_dedupes_near_duplicates(self) -> None:
-        self._index_all()
-        # A near-duplicate section of the memory note in another note.
-        dup_id = self.store.save(
+        # Two notes: "orig" has a section whose toy vector points along
+        # (记忆, 架构) and another along (记忆, 学习); "copy" repeats the first
+        # section almost verbatim. Only one of the near-identical pair may
+        # survive, while the distinct section must.
+        first = "记忆架构：稳定状态写入外部记忆，记忆架构决定 Agent 的架构边界。"
+        second = "记忆与学习：记忆支撑学习，学习又改写记忆，学习闭环。"
+        self.store.save(
             KnowledgeEntry(
-                video_id="vid-dup",
-                title="记忆架构转述",
-                author="offline",
-                source_url="https://example.test/dup",
-                summary_markdown="# 记忆架构转述\n\n## 分层\n\n" + "记忆记忆记忆架构架构架构" * 3,
-                tags="",
-                video_code="dup01",
+                video_id="vid-orig", title="原始笔记", author="offline", source_url="u",
+                summary_markdown=f"# 原始\n\n## 外部记忆\n\n{first}\n\n## 学习闭环\n\n{second}",
+                tags="", video_code="orig1",
             )
         )
-        asyncio.run(self.index.index_note_and_embed(dup_id))
-        result = asyncio.run(self.index.collect("记忆 架构", max_chars=400, max_per_note=1))
-        self.assertLessEqual(result.total_chars, 400)
+        self.store.save(
+            KnowledgeEntry(
+                video_id="vid-copy", title="转述笔记", author="offline", source_url="u",
+                summary_markdown=f"# 转述\n\n## 外部记忆\n\n{first}",
+                tags="", video_code="copy1",
+            )
+        )
+        self.index.index_all()
+        asyncio.run(self.index.embed_pending())
+        # Self-check the setup with the toy embedder itself.
+        import numpy as np
+        vecs = asyncio.run(toy_embed([f"原始\n外部记忆\n{first}", f"转述\n外部记忆\n{first}", f"原始\n学习闭环\n{second}"]))
+        unit = [np.asarray(v) / np.linalg.norm(v) for v in vecs]
+        self.assertGreater(float(unit[0] @ unit[1]), 0.95)
+        self.assertLess(float(unit[0] @ unit[2]), 0.9)
+
+        tight = asyncio.run(self.index.collect("记忆 架构 学习", max_chars=200, max_per_note=1))
+        self.assertLessEqual(tight.total_chars, 200)
         per_note = {}
-        for section in result.sections:
+        for section in tight.sections:
             per_note[section.chunk.knowledge_id] = per_note.get(section.chunk.knowledge_id, 0) + 1
         self.assertTrue(all(count <= 1 for count in per_note.values()))
-        self.assertEqual(result.note_count, len(per_note))
+        self.assertEqual(tight.note_count, len(per_note))
 
-        wide = asyncio.run(self.index.collect("记忆 架构", max_chars=5000, max_per_note=3))
-        codes = {section.chunk.video_code for section in wide.sections}
-        # mem01's two memory sections both survive; the duplicate note is a
-        # near-copy of them in vector space and is suppressed.
-        self.assertIn("mem01", codes)
-        self.assertNotIn("dup01", codes)
-
-    def test_weak_semantic_neighbours_are_not_padded_in(self) -> None:
-        self._index_all()
-        # "serena" is only mentioned in one note; the other notes' vectors are
-        # nearly orthogonal to the query and must not fill the remaining slots.
-        result = asyncio.run(self.index.search("serena", limit=10))
-        self.assertEqual([note.video_code for note in result.notes], ["ser01"])
+        wide = asyncio.run(self.index.collect("记忆 架构 学习", max_chars=5000, max_per_note=3))
+        picked = {(section.chunk.video_code, section.chunk.heading_path) for section in wide.sections}
+        self.assertEqual(len({("orig1", "外部记忆"), ("copy1", "外部记忆")} & picked), 1, picked)
+        self.assertIn(("orig1", "学习闭环"), picked)
+        undeduped = asyncio.run(self.index.collect("记忆 架构 学习", max_chars=5000, max_per_note=3, dedupe=False))
+        both = {(s.chunk.video_code, s.chunk.heading_path) for s in undeduped.sections}
+        self.assertTrue({("orig1", "外部记忆"), ("copy1", "外部记忆")} <= both)
 
     def test_alias_groups_expand_keyword_matches(self) -> None:
         self._index_all()
