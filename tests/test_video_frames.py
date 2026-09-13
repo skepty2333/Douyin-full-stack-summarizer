@@ -92,7 +92,7 @@ class AnnotationSelectionTests(unittest.TestCase):
             [],
         )
 
-    def test_mapping_requires_literal_screenshot_recommendation(self) -> None:
+    def test_mapping_requires_literal_frame_recommendation(self) -> None:
         not_recommended = _annotation("V0001")
         not_recommended["screenshot_recommended"] = False
         truthy_string = _annotation("V0002")
@@ -104,6 +104,19 @@ class AnnotationSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(selected, [])
+        editor_candidate = _annotation("V0003")
+        editor_candidate["screenshot_recommended"] = False
+        editor_candidate["frame_recommended"] = True
+        self.assertEqual(
+            [
+                item.id
+                for item in video_frames.select_frame_annotations(
+                    [editor_candidate],
+                    duration_ms=10_000,
+                )
+            ],
+            ["V0003"],
+        )
         self.assertEqual(
             video_frames.select_frame_annotations(
                 [_annotation("V0001")],
@@ -168,6 +181,7 @@ class FrameQualityTests(unittest.TestCase):
                 quality: float,
                 *,
                 horizontal: bool,
+                caption: str = "关键图表",
             ) -> video_frames.ExtractedVideoFrame:
                 path = directory / f"video_frame_{annotation_id}.jpg"
                 image = Image.new("RGB", (160, 160), "black")
@@ -183,19 +197,33 @@ class FrameQualityTests(unittest.TestCase):
                     path=path,
                     kind="ocr",
                     confidence="high",
-                    caption="关键图表",
+                    caption=caption,
                     quality_score=quality,
                 )
 
             first = make_frame("V0001", 1_000, 9.0, horizontal=False)
             duplicate = make_frame("V0002", 5_000, 8.0, horizontal=False)
-            distinct = make_frame("V0003", 20_000, 7.0, horizontal=True)
+            different_fact = make_frame(
+                "V0004",
+                6_000,
+                8.0,
+                horizontal=False,
+                caption="同一页面里的另一个关键字段",
+            )
+            # A nearby frame can still carry a different highlighted region;
+            # elapsed time alone must not erase it before semantic review.
+            distinct = make_frame("V0003", 8_000, 7.0, horizontal=True)
 
             result = video_frames._deduplicate_similar_frames(
-                {"V0001": first, "V0002": duplicate, "V0003": distinct}
+                {
+                    "V0001": first,
+                    "V0002": duplicate,
+                    "V0003": distinct,
+                    "V0004": different_fact,
+                }
             )
 
-        self.assertEqual(list(result), ["V0001", "V0003"])
+        self.assertEqual(list(result), ["V0001", "V0004", "V0003"])
 
 
 class ExtractionTests(unittest.TestCase):

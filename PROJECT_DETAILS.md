@@ -1,6 +1,6 @@
 # 抖音全栈视频知识总结 Bot：项目详情
 
-本文档说明 `douyin-bot` 的当前系统边界、全阿里云百炼 AI 管线、任务生命周期、稳定性设计、知识库和 MCP 接口，供开发、部署与运维使用。
+本文档说明 `douyin-bot` 的当前系统边界、全阿里云百炼 AI 管线、任务生命周期、稳定性设计、知识库（章节检索、受控词表、自动生长的主题页）和 MCP 接口，供开发、部署与运维使用。
 
 ---
 
@@ -12,11 +12,12 @@
 2. 解析抖音页面，保留公网媒体直链并把视频下载到任务隔离目录。
 3. 优先使用阿里云百炼原生异步 FileTrans 转写公网直链并保留句级时间戳，失败时才通过 FFmpeg 和兼容 ASR 做本地切片回退。
 4. ASR 完成后并行运行 Stage1 视觉增量提取和 Stage2 完整逐字稿研究，再由 Python 确定性合并语音与视觉注释。
-5. 使用全量语音、视觉证据与内部研究备忘生成终稿；可选截图还需经过本地三候选择优和独立模型审核。
+5. 将通过本地三候选择优和独立审核的候选帧作为编辑证据，与全量语音、视觉注释和内部研究备忘一起交给 Stage3；Stage3 再决定信息应转成 Markdown 还是保留截图。
 6. 将终稿规范化为带时间和 caption 的标准 Markdown 图片引用，并把图片清单与元数据写入 SQLite。
 7. 将审核 JPEG 按 SHA-256 内容寻址持久化到 `KNOWLEDGE_ASSETS_DIR`，使图片知识不依赖临时 PDF。
 8. 把 PDF 作为企业微信交付格式渲染并发送；PDF 交付失败时降级为纯文字 Markdown。
-9. 通过 MCP Server 向受控客户端提供知识库搜索、读取、统计以及按需多模态图片读取能力。
+9. 入库后在后台把笔记切成章节并向量化，把标签归一到受控词表，并让聚集到足够密度的词表条目自动长成主题综述页（或让已有主题页重编译）。
+10. 通过 MCP Server 向受控客户端提供章节级混合检索、段落汇集、主题页读取与整理、笔记读取、统计以及按需多模态图片读取能力。
 
 当前解析器只支持抖音域名下的分享链接和视频页链接，不提供 TikTok 解析。
 
@@ -55,9 +56,9 @@ flowchart TD
         ASRFallback["qwen3-asr-flash<br/>本地音频切片回退"]
         Visual["Stage1 qwen3.8-max<br/>只提取视觉增量"]
         Research["Stage2 qwen3.7-plus<br/>完整逐字稿研究 + enable_search"]
-        FrameReview["qwen3.8-max<br/>独立截图审核"]
-        Final["Stage3 qwen3.8-max<br/>全量来源终稿"]
-        Tag["qwen3.7-flash<br/>标签"]
+        FrameReview["qwen3.8-max<br/>独立候选帧审核"]
+        Final["Stage3 qwen3.8-max<br/>全量来源 + 候选帧终稿"]
+        Tag["qwen3.7-flash<br/>领域 / 时效 / 词表标签"]
 
         ASR -->|"成功"| Transcript
         ASR -->|"失败"| ASRFallback --> Transcript
@@ -80,11 +81,16 @@ flowchart TD
     FrameReview --> AssetPersist
 
     subgraph Data["持久化与检索"]
-        DB[("SQLite + WAL + FTS5<br/>knowledge_assets 清单")]
+        DB[("SQLite + WAL<br/>笔记 · 图片清单 · 章节与向量<br/>词表 · 主题页版本")]
         Blobs["KNOWLEDGE_ASSETS_DIR<br/>blobs/sha-prefix/sha256.jpg"]
+        Index["章节切分 + text-embedding-v4<br/>语义 + 关键词 RRF"]
+        Topics["主题出生 / 标脏 / 拆分<br/>qwen3.8-max 编译页面"]
         MCP["MCP Server<br/>127.0.0.1:8090"]
         Client["受控 MCP 客户端"]
 
+        DB --> Index
+        DB --> Topics
+        Index --> Topics
         MCP <--> DB
         MCP <-->|"按需校验读取"| Blobs
         Client <-->|"认证反向代理或受控隧道"| MCP
@@ -116,8 +122,16 @@ flowchart TD
 | `app/services/video_frames.py` | 视觉截图候选校验、本地 FFmpeg 三帧提取、清晰度择优、安全 JPEG 处理、PDF 内嵌和内容寻址知识资产持久化。 |
 | `app/services/wechat_api.py` | 企业微信 Access Token、文本、Markdown 与文件消息发送。 |
 | `app/utils/wechat_crypto.py` | 企业微信回调签名与 AES 加解密。 |
-| `app/database/knowledge_store.py` | SQLite 表、FTS5 索引、`knowledge_assets` 图片清单、内容哈希校验、读写、查重和搜索。 |
-| `mcp_server.py` | Streamable HTTP / stdio MCP 服务与 9 个文字/图片知识库工具。 |
+| `app/database/knowledge_store.py` | SQLite 表、FTS5 索引、`knowledge_assets` 图片清单、内容哈希校验、读写、查重和旧版搜索。 |
+| `app/services/note_chunker.py` | 按标题把笔记 Markdown 切成章节块，生成展示文本与向量化文本。 |
+| `app/database/note_index.py` | `note_chunks` / `chunk_embeddings` 派生表、向量补算、语义 + 关键词混合检索（含别名扩展与领域过滤）与段落汇集。 |
+| `app/database/vocabulary.py` | 受控词表：规范条目、别名归一、合并 / 重命名、笔记关联与计数。 |
+| `app/services/note_tagging.py` | 分类与标签调用：domain / temporality / 词表映射的 JSON 输出与校验。 |
+| `scripts/build_note_index.py` | 建立或刷新章节索引的幂等脚本。 |
+| `app/database/topics.py` | 主题与页面版本：出生、标脏、拆分为枢纽 / 子主题、合并建议、否决。 |
+| `app/services/topic_compiler.py` | 主题页编译：章节取材、引用校验、来源清单、增量重编译、超限拆分。 |
+| `scripts/seed_vocabulary.py`、`scripts/retag_notes.py`、`scripts/backfill_publish_dates.py`、`scripts/grow_topics.py` | 种子词表生成、全库重打标签、发布时间回填、主题整体生长。 |
+| `mcp_server.py` | Streamable HTTP / stdio MCP 服务与 16 个检索、主题与图片工具。 |
 
 视频页面由 `httpx` 直接请求并读取 `_ROUTER_DATA`，项目当前不依赖 `yt-dlp` 完成解析。
 
@@ -134,8 +148,8 @@ flowchart TD
 | 2A | `ALIYUN_VISUAL_MODEL` | `qwen3.8-max` | Stage1 对照完整带时间逐字稿提取视觉增量；不生成摘要或初稿。 |
 | 2B | `ALIYUN_RESEARCH_MODEL` | `qwen3.7-plus` | Stage2 与 Stage1 并行，直接依据完整语音逐字稿进行联网核查和必要知识桥接。 |
 | 2C | 本地 Python | 无 | 按片段 ID 和时间位置确定性地把视觉注释插入逐字稿，不调用模型改写语音。 |
-| 2D | `ALIYUN_VISUAL_MODEL` | `qwen3.8-max` | 独立审核本地候选截图与注释的对应性、可读性、正文价值和隐私安全。 |
-| 3 | `ALIYUN_FINAL_MODEL` | `qwen3.8-max` | Stage3 融合全量原始/增强逐字稿、视觉证据、研究备忘和用户要求，生成最终知识笔记。 |
+| 2D | `ALIYUN_VISUAL_MODEL` | `qwen3.8-max` | 独立审核本地候选帧与注释的对应性、可读性、编辑价值和隐私安全。 |
+| 3 | `ALIYUN_FINAL_MODEL` | `qwen3.8-max` | Stage3 融合全量原始/增强逐字稿、视觉证据、审核候选帧、研究备忘和用户要求，生成最终知识笔记。 |
 | 4 | `ALIYUN_TAG_MODEL` | `qwen3.7-flash` | 生成 5-10 个中文语义标签。 |
 
 `ALIYUN_DRAFT_MODEL` 仅保留为升级现有部署时的配置兼容回退；新部署和文档统一使用 `ALIYUN_VISUAL_MODEL`。
@@ -170,13 +184,15 @@ ASR 完成后，系统立即用 `asyncio.gather` 并行启动两个互不依赖�
 - Stage1 把视频和带 `S-ID` 的完整逐字稿交给 `qwen3.8-max`，只提取语音未表达但画面确实承载的新增信息。
 - Stage2 把完整语音逐字稿直接交给 `qwen3.7-plus` 开展联网研究；它不等待 Stage1，也不读取或猜测视觉结果。
 
-Stage1 不是摘要器，也不生成中间初稿。它不得改写、压缩、润色、事实核查或扩展逐字稿，只能输出经过结构校验的视觉注释，包括时间区间、语音锚点、证据类型、置信度、客观描述和可选截图建议。字幕水印、普通人物出镜、装饰画面、语音同义复述和模糊细节均应忽略；没有有效视觉增量时返回空数组。
+Stage1 不是摘要器，也不生成中间初稿。它不得改写、压缩、润色、事实核查或扩展逐字稿，只能输出经过结构校验的视觉注释，包括时间区间、语音锚点、证据类型、置信度和客观描述。它分别给出“是否抽取原帧供终稿编辑器核对”和“是否可能值得向读者展示”的建议：可完整转写的 OCR、列表、简单表格或代码可以需要前者而不需要后者；难以文字化的形态、空间关系、对象外观或关键动作姿态才倾向后者。普通字幕水印、人物出镜、装饰画面、语音同义复述和模糊细节均应忽略；开头、转场或结尾短暂出现的主题身份标识则不能仅因时长短或带框选而忽略。没有有效视觉增量时返回空数组。
+
+短视频（不超过 180 秒）以 `fps=2` 分析，并使用更高的单帧像素上限，降低短暂小字和标识漏检概率；更长视频保持较低采样率和像素预算。抽帧数量仍有硬上限，避免把“给编辑器看”变成无界图片堆积。
 
 两个分支结束后，本地 Python 按 `anchor_segment_id` 和时间顺序将视觉注释插入原语音片段，生成增强逐字稿。该过程是确定性的：每条原语音恰好保留一次，模型不能借“整理”删除后半段、案例或细节。Stage1 失败时则使用未增加视觉注释的完整逐字稿继续。
 
-### 4.3 本地截图提取与独立审核
+### 4.3 本地候选帧提取与独立审核
 
-只有 Stage1 明确建议截图、置信度和类型符合要求、且未标记敏感信息的视觉注释才有资格进入截图链路。模型只提议内容和时间，不能决定本地路径或直接把图片放入文档。
+只有 Stage1 明确建议抽取编辑候选帧、置信度和类型符合要求、且未标记敏感信息的视觉注释才有资格进入抽帧链路。这个建议与最终是否向读者展示图片分离；模型只提议内容和时间，不能决定本地路径或直接把图片放入文档。
 
 `video_frames.py` 对每个候选执行以下步骤：
 
@@ -184,13 +200,13 @@ Stage1 不是摘要器，也不生成中间初稿。它不得改写、压缩、�
 2. FFmpeg 在目标区间中心及其前后附近各抽取一帧，共三个候选；时间越界时进行安全收敛和去重。
 3. 使用本地 Pillow 指标综合比较边缘细节、曝光、过曝/欠曝比例和对比度，选出最清晰候选。
 4. 对高宽比不小于 `1.35` 的竖屏社交视频，使用确定性的边缘细节与非黑区域密度扫描，裁出信息最集中的方形证据区；独立多模态审核看到的是最终裁切结果，关键内容若被裁坏会被拒绝。
-5. 12 秒内的候选帧只保留质量更高的一张；30 秒内平均视觉哈希近似的候选同样去重，避免同一 PPT、图表或界面因放大镜、高亮和字幕变化连续占页。
+5. 30 秒内、注释语义相同且平均视觉哈希高度近似的候选只保留质量更高的一张；时间接近本身不再构成删除理由，避免同一页面里先后出现的不同关键区域在交给 Stage3 前被误合并。
 6. 移除元数据、限制尺寸和文件大小，重新编码为固定文件名、权限为 `0600` 的 JPEG。
-7. 把候选 JPEG、原视觉注释和附近逐字稿交给一次独立的 `qwen3.8-max` 多模态审核，先逐图检查对应性、可读性、单帧承载能力、正文价值和敏感信息，再从整组候选中只保留最小非重复图片集合。
+7. 把候选 JPEG、原视觉注释和附近逐字稿交给一次独立的 `qwen3.8-max` 多模态审核，先逐图检查对应性、可读性、单帧证据能力、编辑价值和敏感信息，再从整组候选中只保留最小非重复视觉证据集合。文字或表格最终可能转写为 Markdown，不会仅因此在本阶段被拒绝。
 
-截图审核采用 fail-closed：模型调用失败、输出无效、图片不清、描述不对应、只是装饰、含敏感信息或任何本地处理失败时，该截图不会进入终稿，但文字管线继续。审核可收紧截图说明，最终视觉文字与图片 caption 使用同一审核结果，避免互相矛盾。
+候选帧审核采用 fail-closed：模型调用失败、输出无效、图片不清、描述不对应、只是装饰、含敏感信息或任何本地处理失败时，该帧不会交给 Stage3，但文字管线继续。审核可收紧帧说明，最终视觉文字与图片 caption 使用同一审核结果，避免互相矛盾。
 
-Stage3 只能通过受控的临时标记引用审核通过的截图，不能自行构造路径或图片 URL。终稿完成后，同一份受审图片产生两条彼此独立的输出路径：
+审核通过的候选 JPEG 会以受限 Base64 图像输入随 ID、时间和 caption 交给 Stage3。Stage3 先用它们核对和理解视觉信息：纯文字、数字、代码、列表和可准确还原的简单表格优先转成 Markdown；只有文字化会明显损失形态、位置、空间关系、视觉编码、对象外观、演示结果或关键静态姿态时才插入受控临时标记。候选帧输入失败时 Stage3 以完整文字证据重试。Stage3 不能自行构造路径或图片 URL。终稿完成后，实际引用的受审图片产生两条彼此独立的输出路径：
 
 - 知识持久化路径把实际引用的 JPEG 计算 SHA-256，保存为 `KNOWLEDGE_ASSETS_DIR/blobs/<哈希前两位>/<完整哈希>.jpg`，并把临时标记替换成带时间和客观 caption 的标准 Markdown 图片语法，例如 `![视频画面 03:12：任务看板显示四列流程](knowledge-asset://A0001/V0001)`。相同内容可复用同一 blob，正文不暴露服务器路径。
 - PDF 交付路径把临时标记替换为经再次校验、Base64 内嵌的 JPEG；同一图片最多插入一次并受总大小上限约束。证据图在打印样式中设置 `155mm` 最大高度，图片与 caption 作为不可拆分页单元，避免竖图整页放大后把说明挤到单独空白页。PDF 只是一次性交付格式，不是图片知识的持久化边界。
@@ -232,7 +248,8 @@ Stage2 在全部时长档都关闭思考，并按时长限制输出 Token 与备
 
 - `primary_audio_transcript_verbatim`：未经摘要的完整语音原文，用于检查增强文本没有漏句。
 - `primary_enhanced_transcript`：Python 确定性合并后的完整语音与时间对齐视觉增量，是正文组织的主要输入。
-- `primary_visual_evidence`：每条视觉信息的类型、置信度、时间和截图可用状态。
+- `primary_visual_evidence`：每条视觉信息的类型、置信度、时间、编辑候选帧可用状态和初步展示建议。
+- 审核候选帧：按视觉注释 ID 附带的真实 JPEG，仅供 Stage3 核对信息并决定 Markdown 与截图的最佳表达。
 - `internal_research_memo_do_not_quote`：Stage2 的必要纠错、概念、背景、未决问题和来源。
 - 视频元数据、用户关注点和当前时长策略。
 
@@ -253,6 +270,7 @@ Stage2 在全部时长档都关闭思考，并按时长限制输出 Token 与备
 
 - 完整语音与画面共同决定主题、主体结构、观点、机制、步骤、案例、数据、限制、风险、例外与结论。
 - 视觉增量应在对应语义位置融入正文，不另建喧宾夺主的“视觉补充”章节。
+- 候选帧首先是编辑证据而不是展示配额；能准确文字化的内容优先使用 Markdown，只有关键视觉关系难以被文字替代时才保留截图。
 - 研究备忘只用于解决理解障碍、补足适用边界和处理重大事实问题，不得扩展成平行主题，也不得伪装成视频原话。
 - 用户要求只决定关注点与呈现方式，不能改变视频事实或要求补造缺失材料。
 - 正文先判断材料属于解释、论证、叙事、流程、比较或混合型，再选择 Markdown 信息容器：连续论证使用少而完整的自然段；三个以上并列观点、条件、风险、经验或数据改用列表；具有重复比较维度时使用表格；禁止用连续粗体段落模拟“第一、第二”列表。若相邻短段只是解释或延续同一思路则合并。
@@ -261,7 +279,7 @@ Stage2 在全部时长档都关闭思考，并按时长限制输出 Token 与备
 
 一般措辞瑕疵不打断正文；只有会明显误导读者的问题才在准确呈现视频原意后，以简短“补充说明”处理。只有实际采用外部资料时才列参考资料。终稿不展示搜索、核查、纠正或编辑过程。
 
-`qwen3.7-flash` 随后生成最多 10 个去重标签。若模型失败或返回空内容，系统从最终 Markdown 本地提取关键词，保证标签故障不阻塞笔记入库。
+`qwen3.7-flash` 随后对笔记做一次分类与标签调用（`app/services/note_tagging.py`），输出 JSON：`domain`（ai / trading / life / other）、`temporality`（stable / version_sensitive / time_bound）和 3–6 个标签。提示词里注入当前受控词表（规范名、类型、别名），要求优先使用规范名，只有词表确实没有合适条目时才新建，并给新名标注 `kind`（topic / entity / content_type）。返回的标签经别名表归一后写入 `note_tags`，`knowledge.tags` 只保留规范名的逗号列表供展示与旧版匹配。分类调用失败时退回旧的自由标签提示词，笔记照常入库，只是缺少 `domain` / `temporality` 与词表关联，之后可用 `scripts/retag_notes.py` 补齐。
 
 ### 4.6 PDF 交付与矢量公式
 
@@ -419,7 +437,10 @@ curl -fsS http://127.0.0.1:8080/ready
 | `tags` | `qwen3.7-flash` 或本地降级逻辑生成的标签 |
 | `user_requirement` | 用户的特别要求 |
 | `video_code` | 唯一 5 位视频码 |
-| `created_at`、`timestamp` | 创建时间 |
+| `created_at`、`timestamp` | 入库时间 |
+| `published_at` | 抖音发布时间（详情 `create_time`，ISO-8601 UTC）；与入库时间分开保存，旧记录用 `scripts/backfill_publish_dates.py` 回填 |
+| `domain` | ai / trading / life / other，检索可按此过滤 |
+| `temporality` | stable / version_sensitive / time_bound，结果中以"版本敏感 / 时效性"标注，不做隐式时间衰减 |
 
 `summary_markdown` 不保存 Base64、大文件或服务器路径。一个规范图片引用形如：
 
@@ -429,31 +450,88 @@ curl -fsS http://127.0.0.1:8080/ready
 
 SQLite 的 `knowledge_assets` 表是图片资产清单，以 `knowledge_id + asset_key` 唯一定位笔记内图片，保存 `mime_type`、`relative_path`、`sha256`、字节数、宽高、视频时间点、caption、视觉类型、置信度、质量分和展示顺序。JPEG 本体位于 `KNOWLEDGE_ASSETS_DIR/blobs/<sha256 前两位>/<sha256>.jpg`；相同内容自然复用同一路径，而逻辑 URI 在文件去重或部署迁移后保持稳定。图片列表接口从不返回服务器路径。
 
-SQLite 使用 WAL 提高读写并存能力。FTS5 表通过触发器与主表同步，搜索按以下顺序执行：
+SQLite 使用 WAL 提高读写并存能力。旧的 FTS5 表仍由触发器同步，但只作为章节索引尚未建立时的兜底。
 
-1. 标签 `LIKE` 匹配。
-2. FTS5 全文检索标题、作者和正文。
-3. 普通 SQL `LIKE` 兜底。
+### 7.1 章节级混合检索
 
-`search_precise` 对拆分后的关键词应用 AND 逻辑，适合缩小检索范围。标准 Markdown 的时间与 caption 保留在正文 alt 文本中，因此纯文本搜索和不支持图片的客户端仍能理解该视觉证据的基本含义；需要查看原图时再通过 MCP 按需读取。
+检索单位是笔记的章节而不是整篇笔记。`app/services/note_chunker.py` 按 H1/H2/H3 标题把 Markdown 切成章节块（围栏代码内的 `#` 不算标题，超过 1,200 字的章节按段落再切，零散碎片并入前一块），每块保留原始 Markdown 供展示，另生成去掉格式和图片 URI 的 `embed_text` 用于哈希与向量化。当前库 253 条笔记约 3,000 块，中位数 214 字。
+
+`app/database/note_index.py` 在同一 SQLite 中维护两张派生表：
+
+| 表 | 内容 |
+| :--- | :--- |
+| `note_chunks` | `knowledge_id`、`chunk_index`、`heading_path`、正文、`embed_text` 及其 SHA-256；随笔记删除级联删除 |
+| `chunk_embeddings` | 以 `embed_text` 哈希 + 模型 + 维度为主键的 L2 归一化 float32 向量；文本不变则不重算 |
+
+向量由同一 Workspace 的 `text-embedding-v4`（1024 维，OpenAI 兼容 `embeddings` 接口，单次最多 10 条）生成，调用与其他模型一样进入 `model_usage_log`。检索时全部向量载入内存做余弦，几千块规模下毫秒级完成；缓存以表行数为代际号，写入后自动失效。
+
+查询走两路召回再用 RRF（k=60）融合：
+
+1. 语义通道：查询向量与全部章节向量的余弦，取前 200；
+2. 关键词通道：查询按空格/逗号拆词，在章节正文、标题路径、笔记标题和标签中做大小写不敏感的原文匹配（正文 1 分、标题和标签各 0.5 分），保证产品名、工具名这类向量模糊的词精确命中。
+
+笔记排序由其最佳章节决定，命中章节数只做并列时的次序；RRF 分数在名次之间几乎平坦，任何求和式聚合都会让"多段弱命中"压过"单段强命中"。`search_precise` 要求所有关键词都出现在同一条笔记中（标题、标签或任一章节），再按同样的规则排序。语义通道不可用（未配置 Key、接口失败）时自动退化为纯关键词检索并在结果中标明。
+
+`collect_sections` 按融合顺序挑选章节正文直到字数预算：每条笔记最多贡献若干段，与已选段落余弦 ≥ 0.92 的近重复段落被跳过，输出按笔记分组并标注视频码与章节路径。这是"把所有讲 X 的段落一次读完"的入口：20 条相关笔记的全文约 6.8 万字，而它们的相关章节通常 1 万字左右。
+
+索引是派生数据。首次部署或升级后运行 `venv/bin/python scripts/build_note_index.py` 建立（`--rebuild` 重切所有笔记、`--no-embed` 只切分、`--stats` 查看状态）；此后 Bot 在每条笔记入库后于后台切分并向量化，启动时补齐遗漏。
+
+### 7.2 受控词表与标签归一
+
+自由标签会迅速碎片化：253 条笔记曾累积 1,775 个不同标签，87% 只出现一次，"Agent"有 40 种写法。`app/database/vocabulary.py` 用三张表替代：
+
+| 表 | 内容 |
+| :--- | :--- |
+| `vocabulary` | 规范条目：`canonical`、`kind`（topic / entity / content_type / vacuous）、`status`（active / merged / archived）、`merged_into`、`source`（seed / ai / user） |
+| `vocabulary_aliases` | 别名到条目的映射；匹配键为去空白、小写、去 `#` 的名称，因此 `AI Agent`、`ai agent`、`AIAgent` 落到同一条目；规范名本身也是一条别名 |
+| `note_tags` | 笔记与条目的多对多关联，随笔记删除级联删除 |
+
+`kind` 决定条目将来能否长成主题页：只有 topic 与 entity 有资格，内容形式（教程、评测）与空话永远只是标签。合并（`merge`）会把别名与笔记关联搬到目标条目并让旧条目保持可解析；重命名把旧名留作别名。
+
+种子词表由 `scripts/seed_vocabulary.py` 从现有标签一次性聚出（`qwen3.8-max`，`--dry-run` 只看提案，`--from FILE` 载入保存的提案），随后 `scripts/retag_notes.py` 对全部笔记重新分类打标签（默认只处理无词表关联的笔记，`--all` 处理全部）。查询时，命中别名的关键词同时匹配规范名与其余别名（智能体 ↔ Agent ↔ AI Agent），这是关键词通道的同义扩展。
+
+`note_tags.position` 记录标签在笔记中的次序（分类调用按重要性排序输出）。条目的**主次加权**把前两个位置计 1、其余计 0.5：顺带提及的工具（Docker 在 8 条笔记里全是次要标签）不会因此显得"密集"，而总是作为次要方面出现的横切主题（风险管理在 21 条交易笔记里）仍能积累足够权重。
+
+### 7.3 自动生长的主题页
+
+主题不是人为定义的名单，而是词表条目跨过密度线后自动出生的综述页（`app/database/topics.py`、`app/services/topic_compiler.py`）。笔记始终是证据层，主题页是可重建的派生层：最坏的结果是一页没用的综述，而不是被污染的知识。
+
+| 规则 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| 出生 | 主次加权 ≥ 6 且 ≥ 3 位作者，`kind` 为 topic 或 entity | `TOPIC_MIN_NOTES` / `TOPIC_MIN_AUTHORS`；内容形式与空话永远不出生 |
+| 拆分 | 成员 > 40 条 | `TOPIC_MAX_NOTES`；模型把成员分配到 2–5 个子主题（优先复用已有主题），父页退化为枢纽页（子主题索引 + 各自的一句话定义） |
+| 重编译 | 新增成员 ≥ 3 条 | `TOPIC_RECOMPILE_DIRTY`；新笔记打上标签即把主题标脏，到阈值后在后台重编译，也可随时手动触发 |
+| 合并 | 只建议 | 两个主题成员 Jaccard ≥ 0.5 时在 `list_topics` 中提示，由用户确认 |
+| 否决 | 用户 | 页面保留但不再列出、不再重编译 |
+
+编译输入不是整篇笔记：按主题名与别名从成员笔记里挑最相关的章节（每条最多 3 段、共约 2.6 万字，不做近重复抑制以便每个来源都可被引用；每个成员至少贡献开头一段），再补最多 12 段来自非成员但余弦 ≥ 0.62 的章节作为标签漏打的安全网，附上每条笔记的发布日期与时效类型，以及上一版页面。模型（`TOPIC_COMPILE_MODEL`，默认终稿模型）按固定结构输出：一句话定义、核心结论与主流做法（每条带视频码）、不同来源的分歧（并列而非选边）、可能已过时（带日期）、待验证（材料不支持的内容只能放这里）。"来源笔记"一节由系统按实际用到的笔记生成，模型写的会被替换。增量重编译把上一版页面一并给模型，要求保留未被反驳的结论。每个版本连同来源笔记 ID 保存在 `topic_versions`，可回看任一版本。
+
+2026-09-13 首轮在 252 条笔记上长出 41 个主题（Agent 因 41 条成员被拆为枢纽，子主题复用了 Agent架构 / OpenClaw / 多智能体协作 / Agent记忆 / AI应用落地），全部页面的结论行均有视频码引用。`scripts/grow_topics.py` 做整体生长（`--dry-run` 预览、`--list` 看版图、`--compile 名称` 强制一页）；Bot 在每条笔记索引完成后自动执行同样的出生 / 标脏 / 到阈值重编译。标准 Markdown 的时间与 caption 保留在正文 alt 文本中，因此纯文本搜索和不支持图片的客户端仍能理解该视觉证据的基本含义；需要查看原图时再通过 MCP 按需读取。
 
 ---
 
 ## 8. MCP Server
 
-MCP 服务提供 9 个工具：
+MCP 服务提供 16 个工具：
 
 | 工具 | 参数 | 作用 |
 | :--- | :--- | :--- |
-| `search_notes` | `query`, `limit` | 标签、标题和正文的宽松搜索。 |
-| `search_notes_precise` | `query`, `limit` | 所有关键词都必须命中的精确搜索。 |
+| `search_notes` | `query`, `limit`（默认 10，最多 30）, `domain`（可选） | 章节级混合检索；每条笔记只出现一次，返回视频码、发布日期（未知时为入库日期）、时效标注、命中章节数、相似度、最佳章节标题与片段。 |
+| `search_notes_precise` | `query`, `limit`, `domain` | 所有关键词都必须命中同一条笔记的精确搜索，命中后按相关性排序。 |
+| `collect_sections` | `query`, `max_chars`（默认 12,000）, `max_per_note`（默认 3）, `domain` | 汇集最相关的章节正文，跨笔记去重，按笔记分组返回。 |
 | `get_note` | `note_id` | 按数据库 ID 获取完整 Markdown 与元数据；存在图片时提示可按需读取。 |
 | `get_note_by_code` | `video_code` | 按 5 位视频码获取完整 Markdown；保留正文中的逻辑图片 URI。 |
 | `list_note_images` | `note_id` | 按展示顺序列出图片 ID、时间、caption 和 `knowledge-asset://` 引用，不暴露文件路径。 |
 | `get_note_image` | `video_code`, `asset_id` | 解析逻辑引用，校验清单、大小、JPEG 格式和 SHA-256 后返回 MCP `Image`。 |
 | `list_notes` | `limit`, `offset` | 分页列出最近笔记。 |
-| `list_by_tag` | `tag`, `limit` | 按标签筛选笔记。 |
-| `knowledge_stats` | 无 | 查看总笔记数、最新记录与数据库路径。 |
+| `list_by_tag` | `tag`, `limit` | 按规范标签列出笔记；别名（智能体、龙虾）自动归到规范名，不在词表中的词退回子串匹配。 |
+| `list_topics` | 无 | 列出自动生长的主题：成员数、状态、版本、待重编译数、枢纽与子主题层级、合并建议。 |
+| `read_topic` | `name`, `version` | 读取主题综述页（名称或别名均可）；条目尚未成为主题时说明原因。 |
+| `compile_topic` | `name` | 立即（重新）编译一页；条目未出生则先出生，成员超限则先拆分。 |
+| `veto_topic` | `name` | 否决主题：页面保留但不再列出、不再重编译。 |
+| `rename_topic` | `name`, `new_name` | 改名，旧名保留为别名。 |
+| `merge_topics` | `source`, `target` | 把一个条目并入另一个：别名与笔记关联迁移，目标主题标记待重编译。 |
+| `knowledge_stats` | 无 | 查看总笔记数、最新记录、数据库路径、章节索引、词表与主题状态。 |
 
 默认配置为：
 
@@ -462,7 +540,7 @@ MCP_HOST=127.0.0.1
 MCP_PORT=8090
 ```
 
-默认 loopback 监听并保留 FastMCP 的 DNS rebinding 防护。多模态客户端先读取笔记文字，只有需要核对某张视觉证据时才调用 `list_note_images` / `get_note_image`，避免在每次检索中传输全部 JPEG。远程客户端应通过带身份认证的 HTTPS 反向代理、VPN 或受控隧道访问，不应把 MCP 端口直接绑定到公网地址。
+推荐的消费顺序是：宽泛问题先 `read_topic`（`search_notes` 的结果尾部会提示相关主题页），要证据时 `collect_sections` 一次读完相关段落，要上下文时 `get_note_by_code` 读整篇；意图路由由 MCP 客户端选择工具完成，服务端不做查询分类。默认 loopback 监听并保留 FastMCP 的 DNS rebinding 防护。多模态客户端先读取笔记文字，只有需要核对某张视觉证据时才调用 `list_note_images` / `get_note_image`，避免在每次检索中传输全部 JPEG。远程客户端应通过带身份认证的 HTTPS 反向代理、VPN 或受控隧道访问，不应把 MCP 端口直接绑定到公网地址。
 
 ---
 
@@ -493,6 +571,9 @@ chmod 600 .env
 | `MODEL_USAGE_LOG_ENABLED` | `false` | 设为 `true` 并重启 Bot 后采集新调用；关闭不影响读取已有报表。 |
 | `MODEL_USAGE_DB_PATH` | 与 `KNOWLEDGE_DB_PATH` 相同 | 可指向独立 SQLite；必须位于持久化、可备份且 Bot 可写的位置。 |
 | `KNOWLEDGE_ASSETS_DIR` | 与数据库同级的 `knowledge_assets/` | 必须是受 Bot 与 MCP 共同访问的绝对持久化目录；备份、迁移和容量规划应与 SQLite 同步。 |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | `text-embedding-v4` / 1024 | 改动后需 `scripts/build_note_index.py` 重新向量化（向量按模型与维度分开存放）。 |
+| `TOPIC_MIN_NOTES` / `TOPIC_MIN_AUTHORS` | 6 / 3 | 主题出生线（主次加权笔记数 / 作者数）；调低会长出更多更薄的页面。 |
+| `TOPIC_MAX_NOTES` / `TOPIC_RECOMPILE_DIRTY` | 40 / 3 | 超限拆分与自动重编译阈值。 |
 
 ---
 
@@ -502,10 +583,11 @@ chmod 600 .env
 - SQLite 适合单机部署；多实例横向扩展需要外部队列和共享数据库。
 - `/ready` 不验证百炼余额、模型权限或真实网络连通性，完整验证需要受控的端到端测试。
 - FileTrans 主路径可回退到本地切片 ASR；两条 ASR 路径都失败时任务无法生成笔记。
-- 联网研究、视觉增量和截图均可独立降级；可靠转写与终稿仍是生成笔记的必要阶段。
-- 多模态知识由 SQLite 清单和 `KNOWLEDGE_ASSETS_DIR` 两部分组成；只备份数据库或只复制 blob 目录都不是完整备份。
-- 抖音页面结构或反爬策略变化可能导致解析失败。
-- MCP 本身不承担公网认证，安全边界必须由 loopback、反向代理或隧道建立。
+- 联网研究、视觉增量、截图、分类标签、章节索引和主题生长均可独立降级；可靠转写与终稿仍是生成笔记的必要阶段。分类失败的笔记只缺领域 / 时效与词表关联，索引和主题失败可用脚本补齐。
+- 多模态知识由 SQLite 清单和 `KNOWLEDGE_ASSETS_DIR` 两部分组成；只备份数据库或只复制 blob 目录都不是完整备份。章节与向量可重建，词表、标签关联和主题页版本不能。
+- 主题页是模型从章节编译的派生层：结论带视频码可回溯，但编译质量、拆分归属和分类判断都可能出错；笔记本身不会被修改，页面可否决、可重编译、可回看旧版本。词表条目的合并与改名会改变标签归属，不可自动撤销。
+- 抖音页面结构或反爬策略变化可能导致解析失败；已下架的视频取不到发布时间，这类笔记在结果中显示入库时间。
+- MCP 本身不承担公网认证，安全边界必须由 loopback、反向代理或隧道建立；`compile_topic` / `veto_topic` / `rename_topic` / `merge_topics` 会写入知识库并触发付费编译。
 
 ---
 
@@ -521,7 +603,9 @@ chmod 600 .env
 6. MCP 仍监听 `127.0.0.1`，公网入口具有认证与 TLS。
 7. `KNOWLEDGE_ASSETS_DIR` 为绝对路径、权限受限且磁盘空间充足；备份任务同时覆盖 SQLite 与该目录。
 8. 使用一个包含界面、图表和公式的短视频验证句级时间戳、并行视觉/研究、确定性合并、截图审核、二/三级标题结构、规范图片 URI、内容寻址入库、MCP 按需取图和 PDF 交付。
-9. 如已启用用量观测，运行 `scripts/model_usage_report.py --days 1 --details`，确认七类调用可关联到同一 `job_id`/视频码，Token 或音频时长存在，费用未知项有明确原因。
+9. 如已启用用量观测，运行 `scripts/model_usage_report.py --days 1 --details`，确认各类调用（含 `classify_note`、`embedding_index`、`embedding_query`、`topic_compile`、`topic_split`）可关联到同一 `job_id`/视频码，Token 或音频时长存在，费用未知项有明确原因。
 10. 日志中没有 Key、Authorization 头、提示词、逐字稿、媒体 URL、资产绝对路径或完整异常响应。
+11. `scripts/build_note_index.py --stats` 显示待向量化为 0；`knowledge_stats` 中已归一标签的笔记数等于总笔记数；`scripts/grow_topics.py --list` 的版图与预期一致，合并建议已处理或有意保留。
+12. 用一条新视频验证入库后日志依次出现"章节索引完成"、主题标脏或出生、到阈值时"主题编译"，且 `read_topic` 能读到新版本。
 
-以上设计将模型供应链统一到阿里云百炼，并把 Markdown、图片清单和内容寻址 JPEG 作为可持续读取的多模态知识层；PDF 仅负责交付。任务隔离、容量控制、超时重试、完整性校验、健康检查和最小暴露面共同降低单机运行风险。
+以上设计将模型供应链统一到阿里云百炼，并把 Markdown、图片清单和内容寻址 JPEG 作为可持续读取的多模态知识层；PDF 仅负责交付。章节索引、受控词表和自动生长的主题页让新笔记不再是孤立文档，而是持续修正既有知识的来源。任务隔离、容量控制、超时重试、完整性校验、健康检查和最小暴露面共同降低单机运行风险。

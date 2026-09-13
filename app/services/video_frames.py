@@ -60,9 +60,8 @@ FFPROBE_TIMEOUT_SECONDS = 15
 FFMPEG_TIMEOUT_SECONDS = 25
 PORTRAIT_CROP_TRIGGER_RATIO = 1.35
 FRAME_HASH_SIZE = 16
-FRAME_DEDUP_MIN_SPACING_MS = 12_000
 FRAME_DEDUP_MAX_GAP_MS = 30_000
-FRAME_DEDUP_MAX_HASH_DISTANCE = 20
+FRAME_DEDUP_MAX_HASH_DISTANCE = 8
 
 _GENERIC_VISUAL_TEXT = frozenset(
     {
@@ -139,7 +138,7 @@ def select_frame_annotations(
     duration_ms: int,
     max_frames: int = DEFAULT_MAX_FRAMES,
 ) -> list[VisualAnnotation]:
-    """Validate and rank annotations that justify screenshots in the article.
+    """Validate and rank annotations that justify editor context frames.
 
     OCR, UI structure, and state changes are accepted at high or medium confidence.
     ``visible_fact`` is deliberately stricter: only high-confidence facts are
@@ -490,10 +489,13 @@ def _validate_annotation(
             "text": raw.text,
         }
     elif isinstance(raw, Mapping):
-        # Stage 1 may preserve a useful visual fact while explicitly deciding
-        # that it is not worth a full screenshot.  Only the literal boolean
-        # true opts a mapping into frame extraction (truthy strings do not).
-        if raw.get("screenshot_recommended") is not True:
+        # Stage 1 may preserve a useful visual fact without requesting a local
+        # context frame. Only literal booleans opt into extraction (truthy
+        # strings do not). The old key remains accepted for replayed jobs.
+        if (
+            raw.get("frame_recommended") is not True
+            and raw.get("screenshot_recommended") is not True
+        ):
             return None
         values = raw
     else:
@@ -1024,11 +1026,13 @@ def _deduplicate_similar_frames(
 
     kept: list[ExtractedVideoFrame] = []
     hashes: dict[str, int] = {}
+    semantic_keys: dict[str, str] = {}
     ordered = sorted(
         frame_map.values(),
         key=lambda frame: (frame.timestamp_ms, frame.annotation_id),
     )
     for candidate in ordered:
+        candidate_semantic_key = " ".join(candidate.caption.split()).casefold()
         try:
             candidate_hash = _frame_average_hash(candidate)
         except Exception as exc:
@@ -1039,19 +1043,17 @@ def _deduplicate_similar_frames(
             index
             for index, existing in enumerate(kept)
             if (
-                abs(candidate.timestamp_ms - existing.timestamp_ms)
-                <= FRAME_DEDUP_MIN_SPACING_MS
-                or (
-                    abs(candidate.timestamp_ms - existing.timestamp_ms)
-                    <= FRAME_DEDUP_MAX_GAP_MS
-                    and (candidate_hash ^ hashes[existing.annotation_id]).bit_count()
-                    <= FRAME_DEDUP_MAX_HASH_DISTANCE
-                )
+                candidate_semantic_key == semantic_keys[existing.annotation_id]
+                and abs(candidate.timestamp_ms - existing.timestamp_ms)
+                <= FRAME_DEDUP_MAX_GAP_MS
+                and (candidate_hash ^ hashes[existing.annotation_id]).bit_count()
+                <= FRAME_DEDUP_MAX_HASH_DISTANCE
             )
         ]
         if not duplicate_indexes:
             kept.append(candidate)
             hashes[candidate.annotation_id] = candidate_hash
+            semantic_keys[candidate.annotation_id] = candidate_semantic_key
             continue
 
         duplicate_index = min(
@@ -1070,8 +1072,10 @@ def _deduplicate_similar_frames(
         )
         if candidate_quality > existing_quality:
             hashes.pop(existing.annotation_id, None)
+            semantic_keys.pop(existing.annotation_id, None)
             kept[duplicate_index] = candidate
             hashes[candidate.annotation_id] = candidate_hash
+            semantic_keys[candidate.annotation_id] = candidate_semantic_key
 
     return {
         frame.annotation_id: frame

@@ -6,7 +6,9 @@
 ![MCP](https://img.shields.io/badge/MCP-Streamable_HTTP-purple.svg)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)
 
-这是一个面向企业微信的抖音视频知识整理服务。用户发送抖音链接后，Bot 会完成解析下载、语音转写、视觉增量提取、联网研究、终稿编辑、截图审核、知识入库和 PDF 交付。持久层以 Markdown、SQLite 图片清单和内容寻址 JPEG 为准，PDF 只是交付视图；内置 MCP Server 可让多模态客户端继续检索文字并按需读取视频截图。
+这是一个面向企业微信的抖音视频知识整理服务。用户发送抖音链接后，Bot 会完成解析下载、语音转写、视觉增量提取、联网研究、终稿编辑、截图审核、知识入库和 PDF 交付。持久层以 Markdown、SQLite 图片清单和内容寻址 JPEG 为准，PDF 只是交付视图。
+
+笔记入库后不只是多一篇孤立文档：正文按章节切分并向量化，供语义 + 关键词混合检索；标签归一到受控词表并记录发布时间、领域与时效；词表中聚集到足够多笔记与作者的条目会自动长成带来源引用的主题综述页，新笔记累积后自动重编译。内置 MCP Server 把检索、段落汇集、主题页和按需取图暴露给 Claude 等客户端。
 
 当前版本已经统一使用同一阿里云百炼 Workspace 下的 Qwen 模型，不依赖第三方中转 API。
 
@@ -29,12 +31,16 @@ flowchart LR
     Research --> Final["Stage3 终稿"]
     Merge --> Final
     Frames --> Final
-    Final --> Store["Markdown + SQLite + JPEG"]
+    Final --> Classify["分类与词表标签"]
+    Classify --> Store["Markdown + SQLite + JPEG"]
     Final --> PDF["PDF / Markdown 交付"]
-    Store --> MCP["MCP 文字检索与按需取图"]
+    Store --> Index["章节切分 + 向量索引"]
+    Store --> Topics["主题页自动出生 / 重编译"]
+    Index --> MCP["MCP：检索、段落汇集、主题页、取图"]
+    Topics --> MCP
 ```
 
-ASR 完成后，Stage1 和 Stage2 并行运行。Stage1 只提取逐字稿没有表达的画面信息，不生成摘要；Stage2 直接读取完整语音逐字稿，不依赖 Stage1。视觉注释由 Python 按语音片段 ID 和时间确定性插回逐字稿，Stage3 始终同时看到完整原始逐字稿、增强逐字稿、视觉证据和内部研究备忘。
+ASR 完成后，Stage1 和 Stage2 并行运行。Stage1 只提取逐字稿没有表达的画面信息，不生成摘要；Stage2 直接读取完整语音逐字稿，不依赖 Stage1。视觉注释由 Python 按语音片段 ID 和时间确定性插回逐字稿。审核通过的候选帧也会作为编辑证据交给 Stage3，由它选择转写成 Markdown，或仅在视觉关系难以用文字替代时保留截图。
 
 ## 当前功能
 
@@ -55,9 +61,11 @@ ASR 完成后，Stage1 和 Stage2 并行运行。Stage1 只提取逐字稿没有
 | 本地转写回退 | `qwen3-asr-flash` | FileTrans 不可用时提取本地音频，按 240 秒或 7 MB 阈值切片后逐段转写。 |
 | Stage1 视觉增量 | `qwen3.8-max` | 对照完整带时间逐字稿，只提取语音未覆盖的画面信息。 |
 | Stage2 联网研究 | `qwen3.7-plus` | 使用 `enable_search=true` 做必要事实核查、概念桥接和适用边界补充。 |
-| 截图独立审核 | `qwen3.8-max` | 审核候选帧的对应性、清晰度、正文价值、重复性和敏感信息。 |
-| Stage3 终稿 | `qwen3.8-max` | 把完整语音、视觉证据和研究备忘编辑为连贯的 Markdown 知识文章。 |
-| 语义标签 | `qwen3.7-flash` | 生成最多 10 个中文检索标签；失败时回退到本地提取。 |
+| 候选帧独立审核 | `qwen3.8-max` | 审核候选帧的对应性、清晰度、编辑价值、重复性和敏感信息。 |
+| Stage3 终稿 | `qwen3.8-max` | 同时读取完整语音、视觉注释、审核候选帧和研究备忘，选择 Markdown 或截图表达并生成知识文章。 |
+| 分类与标签 | `qwen3.7-flash` | 一次调用给出领域（AI / 交易 / 生活 / 其他）、时效（稳定 / 版本敏感 / 时效性）和 3–6 个受控词表标签；失败时回退到自由标签。 |
+| 章节向量 | `text-embedding-v4` | 笔记章节与查询的 1024 维向量，供语义检索与主题取材。 |
+| 主题页编译 | `qwen3.8-max`（`TOPIC_COMPILE_MODEL`） | 从成员笔记的相关章节编译主题综述页，每条结论标注视频码。 |
 
 Stage2 在所有档位关闭思考。Stage3 的思考预算和输出护栏只由视频时长决定，不因转写字数升降档；达到 10 分钟后使用最高档。
 
@@ -91,13 +99,22 @@ venv/bin/python scripts/model_usage_report.py --days 7 --details --limit 200
 ### 截图、知识库与交付
 
 - FFmpeg 在视觉注释目标时间附近抽取三个候选帧，本地按细节、曝光和对比度择优。
-- 竖屏视频会裁到信息密度较高的证据区域；近时间或视觉哈希近似的画面会去重。
-- 截图审核采用 fail-closed：模型或本地处理失败、图片模糊、内容不对应、仅作装饰或包含敏感信息时直接舍弃，但文字笔记继续生成。
+- “抽帧给终稿编辑器看”和“向读者展示截图”是两个独立决策；OCR、列表和简单表格可提供原帧核对，但通常转成 Markdown 而不插图。
+- 开头、转场和结尾短暂出现的主题名称、版本或目标标识也会纳入视觉扫描；短视频使用 2 FPS 和更高单帧像素预算。
+- 竖屏视频会裁到信息密度较高的证据区域；视觉与注释语义都高度近似的画面会去重，但时间接近而内容不同的证据帧会保留给 Stage3 判断。
+- 候选帧审核采用 fail-closed：模型或本地处理失败、图片模糊、内容不对应、仅作装饰或包含敏感信息时直接舍弃，但文字笔记继续生成。
 - 只有审核通过且被终稿实际引用的 JPEG 才会按 SHA-256 持久化到 `KNOWLEDGE_ASSETS_DIR/blobs/`。
 - 规范 Markdown 使用 `knowledge-asset://<video_code>/<asset_id>` 逻辑 URI，不保存服务器绝对路径。
-- SQLite 使用 WAL 和 FTS5，提供标签优先、全文检索和 `LIKE` 兜底，以及多关键词 AND 精确搜索。
 - PDF 支持 Markdown、表格、代码和 LaTeX。公式由 Matplotlib 渲染为路径化矢量 SVG；视频截图经再次校验后以内嵌数据交给 WeasyPrint。
 - PDF 生成、上传或发送失败时，知识仍已入库，并自动降级为企业微信 Markdown 消息。
+
+### 检索、词表与主题页
+
+- **章节级混合检索**：笔记按 H1/H2/H3 切成约 200–1,200 字的章节块（253 条笔记约 3,000 块），`text-embedding-v4` 向量与关键词原文匹配两路召回、RRF 融合；关键词按稀有度加权，别名自动扩展（智能体 ↔ Agent），语义通道低于 0.40 余弦截断。笔记按其最佳章节排序，每条只出现一次。
+- **段落汇集**：`collect_sections` 把最相关的章节正文按字数预算拼起来、跨笔记去重——20 条相关笔记的全文约 6.8 万字，它们的相关章节通常 1 万字左右，可以一次读完。
+- **元数据**：抖音发布时间与入库时间分开保存；每条笔记有领域与时效类型，结果中以"版本敏感 / 时效性"标注，不做隐式时间衰减。
+- **受控词表**：自由标签会碎片化（曾有 1,775 个标签，87% 只出现一次），改为规范条目 + 别名 + 类型（主题 / 实体 / 内容形式）；标签按重要性排序，前两个计 1、其余计 0.5，顺带提及的工具不会因此显得密集。
+- **主题页自动生长**：条目主次加权 ≥ 6 条且 ≥ 3 位作者即出生并编译；页面固定为一句话定义、核心结论（每条带视频码）、不同来源的分歧、可能已过时（带日期）、待验证、来源笔记；新增 3 条成员自动重编译并保留旧版本，超过 40 条拆成子主题、父页退化为枢纽；合并只建议。用户只保留否决、改名、合并权。
 
 更完整的提示词职责、截图安全链路、动态预算、故障隔离和数据模型见 [PROJECT_DETAILS.md](PROJECT_DETAILS.md)。
 
@@ -153,6 +170,8 @@ DASHSCOPE_NATIVE_BASE_URL=https://YOUR_WORKSPACE_ID.cn-beijing.maas.aliyuncs.com
 | ASR 回退 | `ASR_SEGMENT_SECONDS`、`ASR_MAX_FILE_MB`、`ASR_FILE_POLL_INTERVAL_SECONDS`、`ASR_FILE_TIMEOUT_SECONDS` |
 | 用量观测 | `MODEL_USAGE_LOG_ENABLED`、`MODEL_USAGE_DB_PATH` |
 | 数据与服务 | `TEMP_DIR`、`TEMP_FILE_TTL_HOURS`、`KNOWLEDGE_DB_PATH`、`KNOWLEDGE_ASSETS_DIR`、`SERVER_HOST`、`SERVER_PORT`、`MCP_HOST`、`MCP_PORT` |
+| 章节检索索引 | `EMBEDDING_MODEL`（默认 `text-embedding-v4`）、`EMBEDDING_DIMENSIONS`（默认 1024）、`EMBEDDING_BATCH_SIZE`（默认 10） |
+| 主题生长 | `TOPIC_COMPILE_MODEL`（默认同终稿模型）、`TOPIC_MIN_NOTES`（6）、`TOPIC_MIN_AUTHORS`（3）、`TOPIC_MAX_NOTES`（40）、`TOPIC_RECOMPILE_DIRTY`（3） |
 
 新部署默认让 Bot 和 MCP 都只监听 loopback，由反向代理承担 TLS 与公网边界。只有在已经具备安全组、防火墙或其他受控网络边界时，才应显式改为其他监听地址。
 
@@ -182,6 +201,19 @@ journalctl -u douyin-bot -u douyin-mcp -f
 - `/live` 只表示进程存活。
 - `/ready` 与 `/health` 检查百炼本地配置、FFmpeg/FFprobe、知识库、临时目录权限和磁盘空间；不会发起付费模型请求。
 
+### 5. 建立检索索引、词表与主题（首次或升级后）
+
+```bash
+cd /root/douyin-bot
+venv/bin/python scripts/build_note_index.py            # 切分章节并向量化（幂等，只补缺的）
+venv/bin/python scripts/seed_vocabulary.py             # 首次：从现有标签聚出种子词表
+venv/bin/python scripts/retag_notes.py                 # 为无词表关联的笔记补分类与规范标签
+venv/bin/python scripts/backfill_publish_dates.py      # 回填旧笔记的抖音发布时间
+venv/bin/python scripts/grow_topics.py --dry-run       # 预览会出生的主题，去掉 --dry-run 执行
+```
+
+这些都是派生数据的一次性建立；此后 Bot 会在每条笔记入库后自动完成切分、向量化、标签归一与主题生长。新库从零开始时可以跳过种子词表，词表会随笔记入库自然长出。
+
 ## 使用方式
 
 1. 在抖音 App 复制视频链接并发送给企业微信 Bot。
@@ -202,23 +234,32 @@ journalctl -u douyin-bot -u douyin-mcp -f
 
 | 工具 | 功能 |
 | :--- | :--- |
-| `search_notes` | 标签、标题和正文的宽松检索 |
-| `search_notes_precise` | 所有关键词必须命中的 AND 检索 |
+| `search_notes` | 章节级混合检索（语义向量 + 关键词，RRF 融合，别名扩展），每条笔记只出现一次，返回命中章节、片段、发布日期与时效标注；可按领域过滤 |
+| `search_notes_precise` | 所有关键词必须命中同一条笔记的 AND 检索，命中后按相关性排序 |
+| `collect_sections` | 把最相关的章节正文按字数预算汇集起来，跨笔记去重，供一次通读或综合 |
 | `get_note` | 按数据库 ID 读取完整 Markdown |
 | `get_note_by_code` | 按 5 位视频码读取完整 Markdown |
 | `list_note_images` | 按笔记 ID 列出截图 ID、时间、caption 和逻辑 URI |
 | `get_note_image` | 按视频码和截图 ID 校验并返回单张 JPEG |
 | `list_notes` | 分页列出最近笔记 |
-| `list_by_tag` | 按标签筛选笔记 |
+| `list_by_tag` | 按规范标签列出笔记，别名自动归一（智能体 → Agent，龙虾 → OpenClaw） |
+| `list_topics` / `read_topic` | 自动生长的主题综述页：每条结论带视频码，分歧并列、过时内容带日期、材料不支持的内容进"待验证" |
+| `compile_topic` / `veto_topic` / `rename_topic` / `merge_topics` | 立即重编译、否决、改名、合并——用户只保留否决与整理权，主题本身自动出生 |
 | `knowledge_stats` | 查看知识库统计 |
 
-多模态客户端应先读取 Markdown，只在需要核对视觉证据时调用 `list_note_images` 和 `get_note_image`，避免每次检索传输全部图片。MCP 自身不提供公网身份认证；远程访问应保持 `MCP_HOST=127.0.0.1`，通过带认证的 HTTPS 反向代理、VPN 或 SSH 隧道接入。
+推荐调用顺序：
+
+1. 宽泛的"X 目前怎么做"先 `read_topic`（`search_notes` 的结果尾部会提示相关主题页）；
+2. 要证据或主题页没覆盖时 `search_notes` 找候选，再 `collect_sections` 一次读完所有相关段落；
+3. 需要完整上下文时 `get_note_by_code` 读整篇，需要核对视觉证据时再 `list_note_images` / `get_note_image`。
+
+意图路由由客户端选择工具完成，服务端不做查询分类。章节索引、词表关联和主题页都是派生数据，索引未建立时搜索自动退回旧版匹配。`compile_topic` / `veto_topic` / `rename_topic` / `merge_topics` 会写入知识库，因此 MCP 端点必须保持在受控边界内：MCP 自身不提供公网身份认证，远程访问应保持 `MCP_HOST=127.0.0.1`，通过带认证的 HTTPS 反向代理、VPN 或受控隧道接入。
 
 ## 数据与备份
 
 以下运行数据默认被 `.gitignore` 排除，不会随着代码推送到 GitHub：
 
-- `knowledge.db` 及其 `-wal`、`-shm` 文件：笔记、标签、图片清单；开启用量观测后默认也包含 `model_usage_log` 调用观测表。
+- `knowledge.db` 及其 `-wal`、`-shm` 文件：笔记、图片清单、章节与向量索引、词表与标签关联、主题页及其历史版本；开启用量观测后默认也包含 `model_usage_log` 调用观测表。章节与向量可以用脚本重建，词表和主题页版本不能。
 - `knowledge_assets/`：审核后、按内容哈希存放的 JPEG。
 - `.env`：企业微信凭据和百炼 API Key。
 - `/tmp/douyin-bot/jobs/`：会自动清理的临时任务文件。
@@ -233,17 +274,28 @@ journalctl -u douyin-bot -u douyin-mcp -f
 ├── mcp_server.py                   # Streamable HTTP / stdio MCP 服务
 ├── app/
 │   ├── config.py                   # 环境变量与本地配置校验
-│   ├── database/knowledge_store.py # SQLite、FTS5、图片清单与完整性校验
+│   ├── database/knowledge_store.py # SQLite 笔记、图片清单、元数据列与完整性校验
+│   ├── database/note_index.py      # 章节 / 向量派生表与混合检索、段落汇集
+│   ├── database/vocabulary.py      # 受控词表、别名归一、笔记标签关联
+│   ├── database/topics.py          # 主题出生 / 标脏 / 拆分 / 版本
 │   ├── database/model_usage_store.py # 模型调用明细、价格快照与汇总
 │   └── services/
-│       ├── aliyun_client.py        # 百炼原生/兼容接口、超时、并发与重试
-│       ├── ai_summarizer.py        # ASR、并行视觉/研究、终稿和标签
-│       ├── douyin_parser.py        # 抖音解析、隔离下载与音频提取
+│       ├── aliyun_client.py        # 百炼原生/兼容接口、embeddings、超时、并发与重试
+│       ├── ai_summarizer.py        # ASR、并行视觉/研究、终稿
+│       ├── note_tagging.py         # 领域 / 时效分类与词表标签
+│       ├── note_chunker.py         # Markdown 章节切分
+│       ├── topic_compiler.py       # 主题页编译、引用校验、超限拆分
+│       ├── douyin_parser.py        # 抖音解析、发布时间、隔离下载与音频提取
 │       ├── video_frames.py         # 抽帧、审核输入、去重和知识图片持久化
 │       ├── pdf_generator.py        # Markdown、矢量公式与 PDF
 │       └── wechat_api.py           # 企业微信 Token、消息和文件上传
 ├── deployment/                     # systemd 与 Nginx 模板
 ├── scripts/setup.sh                # Alibaba Cloud Linux 3 安装脚本
+├── scripts/build_note_index.py     # 建立 / 刷新章节索引
+├── scripts/seed_vocabulary.py      # 从现有标签生成种子词表
+├── scripts/retag_notes.py          # 全库分类与标签归一
+├── scripts/backfill_publish_dates.py # 回填抖音发布时间
+├── scripts/grow_topics.py          # 主题整体生长、预览与强制编译
 ├── scripts/model_usage_report.py   # Token、音频时长与费用只读报表
 ├── tests/                          # 离线单元与集成边界测试
 ├── PROJECT_DETAILS.md              # 完整架构与实现约束
@@ -262,7 +314,7 @@ systemd-analyze verify deployment/douyin-bot.service deployment/douyin-mcp.servi
 venv/bin/python scripts/model_usage_report.py --days 7
 ```
 
-测试覆盖动态时长档、FileTrans 与本地回退、Stage1/Stage2 并行、逐字稿完整性、截图独立审核、调用日志隐私边界、Token/缓存/音频计费、路径与大小限制、内容寻址图片、MCP 多模态取图、公式 PDF、企业微信分段发送和队列状态转换。付费模型权限、抖音页面可用性与企业微信回调仍需通过受控的端到端任务验证。
+测试覆盖动态时长档、FileTrans 与本地回退、Stage1/Stage2 并行、逐字稿完整性、截图独立审核、调用日志隐私边界、Token/缓存/音频计费、路径与大小限制、内容寻址图片、章节切分与混合检索（含降级、别名扩展、领域过滤、近重复抑制）、词表归一与合并、分类解析、主题出生 / 编译 / 拆分 / 否决、MCP 全部工具、公式 PDF、企业微信分段发送和队列状态转换。付费模型权限、抖音页面可用性、企业微信回调与主题页的实际编译质量仍需通过受控的端到端任务验证。
 
 ## 已知边界
 
@@ -270,8 +322,9 @@ venv/bin/python scripts/model_usage_report.py --days 7
 - SQLite 面向单机部署；多实例需要外部队列、共享数据库和共享图片存储。
 - 抖音页面结构、反爬策略和数据中心 IP 限制可能导致解析失败。
 - `/ready` 不验证百炼余额、实际模型权限或外部网络连通性。
-- FileTrans 与本地 ASR 都失败时无法生成笔记；视觉、研究、截图和 PDF 可以独立降级。
-- MCP 只负责知识读取，不承担公网认证与 TLS。
+- FileTrans 与本地 ASR 都失败时无法生成笔记；视觉、研究、截图、分类标签、章节索引和主题生长都可以独立降级，缺失部分可用脚本补齐。
+- 主题页是模型从笔记章节编译的派生层：结论都带视频码可回溯，但编译质量仍可能出错；笔记本身不会被修改，页面可否决、可重编译、可回看旧版本。
+- MCP 不承担公网认证与 TLS；主题相关工具会写入知识库，端点必须留在受控边界内。
 
 ## 许可证
 

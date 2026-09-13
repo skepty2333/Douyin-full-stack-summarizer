@@ -1,0 +1,19 @@
+[Unit]
+Description=Cloudflare Quick Tunnel for Douyin Knowledge MCP
+Wants=network-online.target douyin-mcp.service
+After=network-online.target douyin-mcp.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/douyin-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/douyin-bot/scripts/cloudflared_quicktunnel.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

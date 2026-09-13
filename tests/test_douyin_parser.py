@@ -5,7 +5,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs
 from unittest.mock import patch
+
+import httpx
 
 
 with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "offline-test-key"}, clear=False):
@@ -66,6 +69,100 @@ class DouyinShareRequirementTests(unittest.TestCase):
             douyin_parser.extract_user_requirement(text, url),
             "请重点整理任务管理方法，忽略广告。",
         )
+
+
+class DouyinCurrentParserTests(unittest.TestCase):
+    VIDEO_ID = "7672445901280955694"
+
+    def test_extract_video_id_from_current_share_redirect(self) -> None:
+        redirected = (
+            "https://www.iesdouyin.com/share/video/7672445901280955694/"
+            "?region=CN&from_aid=1128"
+        )
+
+        self.assertEqual(douyin_parser._extract_video_id(redirected), self.VIDEO_ID)
+
+    def test_empty_router_payload_requests_detail_fallback(self) -> None:
+        html = (
+            '<script>window._ROUTER_DATA = {"loaderData":{'
+            '"video_(id)/page":{"itemId":"7672445901280955694"}}}</script>'
+        )
+
+        self.assertIsNone(douyin_parser._extract_router_item(html))
+
+    def test_select_video_url_prefers_direct_cdn(self) -> None:
+        item = {
+            "video": {
+                "play_addr": {
+                    "url_list": [
+                        "https://www.douyin.com/aweme/v1/play/?video_id=abc",
+                        "//v3-dy-o.examplecdn.com/video.mp4",
+                    ]
+                }
+            }
+        }
+
+        self.assertEqual(
+            douyin_parser._select_video_url(item),
+            "https://v3-dy-o.examplecdn.com/video.mp4",
+        )
+
+
+class DouyinSignedDetailTests(unittest.IsolatedAsyncioTestCase):
+    async def test_signed_detail_uses_anonymous_ttwid(self) -> None:
+        video_id = "7672445901280955694"
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.host)
+            if request.url.host == "ttwid.bytedance.com":
+                return httpx.Response(
+                    200,
+                    json={"status_code": 0},
+                    headers={"set-cookie": "ttwid=test-visitor; Path=/; HttpOnly"},
+                )
+
+            self.assertEqual(request.url.host, "www.douyin.com")
+            query = parse_qs(request.url.query.decode("ascii"))
+            self.assertEqual(query["aweme_id"], [video_id])
+            self.assertIn("a_bogus", query)
+            self.assertIn("ttwid=test-visitor", request.headers.get("cookie", ""))
+            return httpx.Response(
+                200,
+                json={
+                    "status_code": 0,
+                    "aweme_detail": {
+                        "aweme_id": video_id,
+                        "desc": "测试作品",
+                        "author": {"nickname": "测试作者"},
+                        "video": {
+                            "play_addr": {
+                                "url_list": ["https://cdn.example.com/video.mp4"]
+                            }
+                        },
+                    },
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            detail = await douyin_parser._fetch_aweme_detail(client, video_id)
+
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["desc"], "测试作品")
+        self.assertEqual(calls, ["ttwid.bytedance.com", "www.douyin.com"])
+
+
+class PublishTimeTests(unittest.TestCase):
+    def test_unix_seconds_and_strings_become_iso_utc(self) -> None:
+        self.assertEqual(douyin_parser._publish_time({"create_time": 1786265237}), "2026-08-09T08:47:17+00:00")
+        self.assertEqual(douyin_parser._publish_time({"create_time": "1786265237"}), "2026-08-09T08:47:17+00:00")
+        self.assertEqual(douyin_parser._publish_time({"create_time": 1786265237000}), "2026-08-09T08:47:17+00:00")
+
+    def test_missing_or_implausible_values_yield_empty(self) -> None:
+        for value in (None, True, 5, -1, "soon", 99999999999999):
+            self.assertEqual(douyin_parser._publish_time({"create_time": value}), "", repr(value))
+        self.assertEqual(douyin_parser._publish_time({}), "")
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ from app.config import (
     CORP_ID, CALLBACK_TOKEN, CALLBACK_AES_KEY,
     TEMP_DIR, LOG_LEVEL, SERVER_HOST, SERVER_PORT,
     KNOWLEDGE_ASSETS_DIR, MAX_CONCURRENT_JOBS, JOB_TIMEOUT_SECONDS, DOWNLOAD_TIMEOUT_SECONDS,
-    MODEL_USAGE_LOG_ENABLED,
+    MODEL_USAGE_LOG_ENABLED, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS,
     validate_ai_config,
 )
 from app.utils.wechat_crypto import WXBizMsgCrypt
@@ -44,7 +44,7 @@ from app.services.douyin_parser import (
     resolve_and_download, cleanup_files, cleanup_stale_job_dirs,
 )
 from app.services.ai_summarizer import summarize_with_artifacts, generate_tags_with_ai
-from app.services.aliyun_client import close_aliyun_client
+from app.services.aliyun_client import aliyun_client, close_aliyun_client
 from app.services.pdf_generator import generate_pdf
 from app.services.video_frames import (
     persist_video_frame_markers_for_storage,
@@ -52,6 +52,11 @@ from app.services.video_frames import (
     strip_video_frame_markers_for_storage,
 )
 from app.database.knowledge_store import KnowledgeAsset, KnowledgeStore, KnowledgeEntry
+from app.database.note_index import NoteIndex
+from app.database.topics import TopicStore
+from app.database.vocabulary import VocabularyStore
+from app.services.note_tagging import classify_note, link_note_tags, resolve_tags
+from app.services.topic_compiler import TopicCompiler
 from app.database.model_usage_store import (
     bind_model_usage_context,
     get_model_usage_store,
@@ -72,6 +77,75 @@ logger = logging.getLogger("douyin-bot")
 
 crypto = WXBizMsgCrypt(CALLBACK_TOKEN, CALLBACK_AES_KEY, CORP_ID)
 knowledge_db = KnowledgeStore()
+
+
+async def _embed_for_index(texts):
+    return await aliyun_client.embed(
+        model=EMBEDDING_MODEL,
+        texts=texts,
+        dimensions=EMBEDDING_DIMENSIONS,
+        operation="embedding_index",
+    )
+
+
+# 受控词表：标签调用把笔记映射到规范条目，新条目只在词表确实没有时创建。
+vocabulary = VocabularyStore()
+# 章节级检索索引：笔记入库后在后台切分并向量化，失败不影响交付。
+note_index = NoteIndex(embed_fn=_embed_for_index, alias_groups_fn=vocabulary.alias_groups)
+# 主题：入库后在后台让主题出生 / 标脏 / 到阈值重编译；任何失败都不影响交付。
+topic_store = TopicStore(vocabulary=vocabulary)
+topic_compiler = TopicCompiler(store=knowledge_db, index=note_index, topics=topic_store)
+_topic_lock = asyncio.Lock()
+
+
+async def _index_note_in_background(entry_id: int) -> None:
+    try:
+        report = await note_index.index_note_and_embed(entry_id)
+        logger.info(
+            "章节索引完成: note=%s chunks=%s pending=%s",
+            entry_id, report.chunks_written, report.embeddings_pending,
+        )
+    except Exception:
+        logger.exception("章节索引失败: note=%s（可用 scripts/build_note_index.py 补齐）", entry_id)
+        return
+    await _grow_topics_after_note(entry_id)
+
+
+async def _grow_topics_after_note(entry_id: int) -> None:
+    """Runs after indexing: births, dirty marks, and due recompiles for one note."""
+    async with _topic_lock:
+        try:
+            for entry in await asyncio.to_thread(topic_store.eligible_entries):
+                topic = await asyncio.to_thread(topic_store.born, entry)
+                logger.info("主题出生: %s（%s）", topic.name, topic.reason)
+            due = await asyncio.to_thread(topic_store.note_tagged, entry_id)
+            pending = {t.id: t for t in due}
+            for topic in await asyncio.to_thread(topic_store.list_topics):
+                if topic.latest_version == 0 and not topic.is_hub:
+                    pending.setdefault(topic.id, topic)
+            for topic in pending.values():
+                if topic_store.needs_split(topic):
+                    split = await topic_compiler.split(topic)
+                    logger.info("主题拆分: %s → %s", topic.name, [c.name for c in split.children])
+                    for child in split.children:
+                        if child.latest_version == 0:
+                            await topic_compiler.compile(child)
+                    topic = await asyncio.to_thread(topic_store.get, topic.id) or topic
+                result = await topic_compiler.compile(topic)
+                logger.info("主题编译: %s v%s", result.topic.name, result.version.version)
+        except Exception:
+            logger.exception("主题生长失败: note=%s（可用 scripts/grow_topics.py 重试）", entry_id)
+
+
+async def _catch_up_note_index() -> None:
+    """Index notes saved while indexing was unavailable (crash, API outage)."""
+    try:
+        report = await asyncio.to_thread(note_index.index_all, only_missing=True)
+        embedded = await note_index.embed_pending()
+        if report.notes_indexed or embedded:
+            logger.info("章节索引补齐: notes=%s embedded=%s", report.notes_indexed, embedded)
+    except Exception:
+        logger.exception("章节索引补齐失败（可用 scripts/build_note_index.py 重试）")
 
 # 消息去重
 _processed_msgs: Dict[str, float] = {}
@@ -115,6 +189,7 @@ class PendingTask:
     parsed_video_id: str = ""
     parsed_video_path: str = ""
     parsed_media_url: str = ""
+    parsed_published_at: str = ""
 
 
 @dataclass
@@ -198,6 +273,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("模型调用日志数据库初始化失败")
     _accepting_messages = True
+    _spawn_background(_catch_up_note_index())
     logger.info("Bot 启动")
     yield
     _accepting_messages = False
@@ -510,6 +586,7 @@ async def _process_task_init(
         task.parsed_author = video_info["author"] or "未知作者"
         task.parsed_video_path = video_info["video_path"]
         task.parsed_media_url = video_info.get("video_url", "")
+        task.parsed_published_at = video_info.get("published_at", "") or ""
 
         # 查重 (Title + Author)
         duplicates = await asyncio.to_thread(
@@ -600,11 +677,27 @@ async def _execute_summary_task(
                     summary = strip_video_frame_markers_for_storage(
                         summary_result.markdown
                     )
-                    tags = await generate_tags_with_ai(
+                    classification = await classify_note(
                         summary,
                         task.parsed_title,
                         task.parsed_author,
+                        vocabulary=vocabulary,
                     )
+                    if classification is not None:
+                        applied_tags = await asyncio.to_thread(
+                            resolve_tags, classification, vocabulary=vocabulary
+                        )
+                        tags = ",".join(applied_tags.canonical_names)
+                        domain, temporality = classification.domain, classification.temporality
+                    else:
+                        # 分类失败时退回自由标签，只丢失 domain/temporality，可用 scripts/retag_notes.py 补。
+                        applied_tags = None
+                        domain = temporality = ""
+                        tags = await generate_tags_with_ai(
+                            summary,
+                            task.parsed_title,
+                            task.parsed_author,
+                        )
                 storage_summary, persisted_frames = await asyncio.to_thread(
                     persist_video_frame_markers_for_storage,
                     summary_result.markdown,
@@ -640,13 +733,24 @@ async def _execute_summary_task(
                     user_requirement=req,
                     duration_seconds=summary_result.diagnostics.duration_seconds or 0.0,
                     video_code=video_code,
+                    published_at=task.parsed_published_at,
+                    domain=domain,
+                    temporality=temporality,
                 )
-                await asyncio.to_thread(
+                entry_id = await asyncio.to_thread(
                     knowledge_db.save,
                     entry,
                     allow_overwrite,
                     knowledge_assets,
                 )
+                if applied_tags is not None:
+                    try:
+                        await asyncio.to_thread(
+                            link_note_tags, entry_id, applied_tags, vocabulary=vocabulary
+                        )
+                    except Exception:
+                        logger.exception("词表关联失败: note=%s（可用 scripts/retag_notes.py 补）", entry_id)
+                _spawn_background(_index_note_in_background(entry_id))
 
                 pdf_path = os.path.join(os.path.dirname(task.parsed_video_path), "summary.pdf")
                 pdf_delivered = False
