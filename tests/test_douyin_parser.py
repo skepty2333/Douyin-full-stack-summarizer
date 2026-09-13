@@ -153,5 +153,17 @@ class DouyinSignedDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, ["ttwid.bytedance.com", "www.douyin.com"])
 
 
+class PublishTimeTests(unittest.TestCase):
+    def test_unix_seconds_and_strings_become_iso_utc(self) -> None:
+        self.assertEqual(douyin_parser._publish_time({"create_time": 1786265237}), "2026-08-09T08:47:17+00:00")
+        self.assertEqual(douyin_parser._publish_time({"create_time": "1786265237"}), "2026-08-09T08:47:17+00:00")
+        self.assertEqual(douyin_parser._publish_time({"create_time": 1786265237000}), "2026-08-09T08:47:17+00:00")
+
+    def test_missing_or_implausible_values_yield_empty(self) -> None:
+        for value in (None, True, 5, -1, "soon", 99999999999999):
+            self.assertEqual(douyin_parser._publish_time({"create_time": value}), "", repr(value))
+        self.assertEqual(douyin_parser._publish_time({}), "")
+
+
 if __name__ == "__main__":
     unittest.main()

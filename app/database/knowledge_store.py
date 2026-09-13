@@ -38,6 +38,9 @@ class KnowledgeEntry:
     duration_seconds: float = 0.0
     video_code: str = ""            # 5位随机码 (uid)
     timestamp: str = ""             # 北京时间
+    published_at: str = ""          # 抖音发布时间（ISO-8601 UTC），旧记录可能为空
+    domain: str = ""                # ai | trading | life | other，由标签模型判定
+    temporality: str = ""           # stable | version_sensitive | time_bound
 
 
 @dataclass(frozen=True)
@@ -328,6 +331,15 @@ class KnowledgeStore:
                 CREATE INDEX IF NOT EXISTS idx_knowledge_assets_sha256
                 ON knowledge_assets(sha256);
             """)
+            # 非破坏性列迁移：老库缺少的元数据列在此补齐，默认空字符串。
+            existing = {
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(knowledge)")
+            }
+            for column in ("published_at", "domain", "temporality"):
+                if column not in existing:
+                    conn.execute(
+                        f"ALTER TABLE knowledge ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    )
             conn.commit()
             logger.info(f"知识库初始化完成 (持久化模式): {self.db_path}")
         finally:
@@ -358,11 +370,13 @@ class KnowledgeStore:
                 entry.tags, entry.user_requirement,
                 entry.created_at, entry.duration_seconds,
                 entry.video_code, entry.timestamp,
+                entry.published_at, entry.domain, entry.temporality,
             )
             base_sql = """INSERT INTO knowledge
                 (video_id, title, author, source_url, summary_markdown,
-                 tags, user_requirement, created_at, duration_seconds, video_code, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                 tags, user_requirement, created_at, duration_seconds, video_code, timestamp,
+                 published_at, domain, temporality)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
             if allow_overwrite:
                 base_sql += """
                     ON CONFLICT(video_code) DO UPDATE SET
@@ -375,7 +389,10 @@ class KnowledgeStore:
                         user_requirement=excluded.user_requirement,
                         created_at=excluded.created_at,
                         duration_seconds=excluded.duration_seconds,
-                        timestamp=excluded.timestamp
+                        timestamp=excluded.timestamp,
+                        published_at=excluded.published_at,
+                        domain=excluded.domain,
+                        temporality=excluded.temporality
                 """
             cursor = conn.execute(base_sql, values)
             if allow_overwrite:
@@ -423,6 +440,40 @@ class KnowledgeStore:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def update_metadata(
+        self,
+        entry_id: int,
+        *,
+        published_at: Optional[str] = None,
+        domain: Optional[str] = None,
+        temporality: Optional[str] = None,
+        tags: Optional[str] = None,
+    ) -> bool:
+        """Update derived metadata columns without touching the note body."""
+        assignments = []
+        params: list = []
+        for column, value in (
+            ("published_at", published_at),
+            ("domain", domain),
+            ("temporality", temporality),
+            ("tags", tags),
+        ):
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+        if not assignments:
+            return False
+        params.append(entry_id)
+        conn = self._get_conn()
+        try:
+            cursor = conn.execute(
+                f"UPDATE knowledge SET {', '.join(assignments)} WHERE id = ?", params
+            )
+            conn.commit()
+            return cursor.rowcount > 0
         finally:
             conn.close()
 

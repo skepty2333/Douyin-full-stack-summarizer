@@ -242,6 +242,34 @@ class NoteIndexTests(unittest.TestCase):
         result = asyncio.run(self.index.search("serena", limit=10))
         self.assertEqual([note.video_code for note in result.notes], ["ser01"])
 
+    def test_alias_groups_expand_keyword_matches(self) -> None:
+        self._index_all()
+        groups = {"智能体": ("Agent", "智能体"), "agent": ("Agent", "智能体")}
+        aliased = NoteIndex(
+            self.db_path,
+            embed_fn=None,
+            alias_groups_fn=lambda: groups,
+            model="toy",
+            dimensions=len(VOCAB),
+        )
+        # No note contains the literal string 智能体; mem01 and ser01 mention Agent.
+        result = asyncio.run(aliased.search("智能体", limit=5))
+        self.assertEqual({note.video_code for note in result.notes}, {"mem01", "ser01"})
+        plain = asyncio.run(NoteIndex(self.db_path, embed_fn=None, model="toy", dimensions=len(VOCAB)).search("智能体"))
+        self.assertEqual(plain.notes, [])
+
+    def test_domain_filter_applies_to_both_channels(self) -> None:
+        self._index_all()
+        self.store.update_metadata(self.ids["trd01"], domain="trading")
+        self.store.update_metadata(self.ids["mem01"], domain="ai")
+        everything = asyncio.run(self.index.search("止损 记忆", limit=5))
+        self.assertGreaterEqual(len(everything.notes), 2)
+        trading_only = asyncio.run(self.index.search("止损 记忆", limit=5, domain="trading"))
+        self.assertEqual([note.video_code for note in trading_only.notes], ["trd01"])
+        self.assertEqual(trading_only.notes[0].domain, "trading")
+        collected = asyncio.run(self.index.collect("止损 记忆", domain="ai"))
+        self.assertEqual({section.chunk.video_code for section in collected.sections}, {"mem01"})
+
     def test_empty_query_returns_nothing(self) -> None:
         self._index_all()
         self.assertEqual(asyncio.run(self.index.search("   ")).notes, [])

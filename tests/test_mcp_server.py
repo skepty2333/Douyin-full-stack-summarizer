@@ -11,6 +11,7 @@ import unittest
 import mcp_server
 from app.database.knowledge_store import KnowledgeAsset, KnowledgeEntry, KnowledgeStore
 from app.database.note_index import NoteIndex
+from app.database.vocabulary import VocabularyStore
 
 
 VOCAB = ["记忆", "止损", "咖啡"]
@@ -101,9 +102,16 @@ class MCPSearchToolTests(unittest.TestCase):
         root = Path(self.temp_dir.name)
         db_path = str(root / "knowledge.db")
         self.store = KnowledgeStore(db_path, asset_root=str(root / "assets"))
-        self.index = NoteIndex(db_path, embed_fn=toy_embed, model="toy", dimensions=len(VOCAB))
-        self.original = (mcp_server.store, mcp_server.index)
-        mcp_server.store, mcp_server.index = self.store, self.index
+        self.vocab = VocabularyStore(db_path)
+        self.index = NoteIndex(
+            db_path,
+            embed_fn=toy_embed,
+            alias_groups_fn=self.vocab.alias_groups,
+            model="toy",
+            dimensions=len(VOCAB),
+        )
+        self.original = (mcp_server.store, mcp_server.index, mcp_server.vocabulary)
+        mcp_server.store, mcp_server.index, mcp_server.vocabulary = self.store, self.index, self.vocab
         notes = (
             (
                 "mem01",
@@ -115,8 +123,15 @@ class MCPSearchToolTests(unittest.TestCase):
             ("trd01", "止损的数学真相", "# 止损\n\n## 仓位公式\n\n止损决定单笔风险，仓位公式以止损为分母。"),
             ("cof01", "咖啡与心血管", "# 咖啡\n\n## 每天几杯\n\n两到三杯咖啡获益最大。"),
         )
+        self.note_ids = {}
+        metadata = {
+            "mem01": ("ai", "version_sensitive", "2026-03-01T00:00:00+00:00"),
+            "trd01": ("trading", "stable", "2025-12-02T13:21:57+00:00"),
+            "cof01": ("life", "time_bound", ""),
+        }
         for code, title, markdown in notes:
-            self.store.save(
+            domain, temporality, published = metadata[code]
+            self.note_ids[code] = self.store.save(
                 KnowledgeEntry(
                     video_id=f"vid-{code}",
                     title=title,
@@ -125,11 +140,16 @@ class MCPSearchToolTests(unittest.TestCase):
                     summary_markdown=markdown,
                     tags="测试",
                     video_code=code,
+                    published_at=published,
+                    domain=domain,
+                    temporality=temporality,
                 )
             )
+        agent = self.vocab.upsert_entry("Agent", kind="topic", aliases=["智能体"], source="seed")
+        self.vocab.set_note_tags(self.note_ids["mem01"], [agent.id])
 
     def tearDown(self) -> None:
-        mcp_server.store, mcp_server.index = self.original
+        mcp_server.store, mcp_server.index, mcp_server.vocabulary = self.original
         self.temp_dir.cleanup()
 
     def _build_index(self) -> None:
@@ -177,12 +197,46 @@ class MCPSearchToolTests(unittest.TestCase):
         )
         self.assertIn("章节索引未建立", collect)
 
+    def test_results_show_publish_date_and_temporality(self) -> None:
+        self._build_index()
+        text = asyncio.run(mcp_server.search_notes(mcp_server.SearchInput(query="止损 仓位", limit=3)))
+        self.assertIn("`trd01`", text)
+        self.assertIn("发布 2025-12-02", text)
+        mem = asyncio.run(mcp_server.search_notes(mcp_server.SearchInput(query="记忆", limit=3)))
+        self.assertIn("版本敏感", mem)
+        coffee = asyncio.run(mcp_server.search_notes(mcp_server.SearchInput(query="咖啡", limit=3)))
+        self.assertIn("入库 ", coffee)  # no publish date known
+        self.assertIn("时效性", coffee)
+
+    def test_domain_filter_narrows_search(self) -> None:
+        self._build_index()
+        text = asyncio.run(
+            mcp_server.search_notes(mcp_server.SearchInput(query="止损 记忆", limit=5, domain="trading"))
+        )
+        self.assertIn("仅 交易 领域", text)
+        self.assertIn("`trd01`", text)
+        self.assertNotIn("`mem01`", text)
+
+    def test_list_by_tag_resolves_aliases_through_vocabulary(self) -> None:
+        text = asyncio.run(mcp_server.list_by_tag(mcp_server.TagFilterInput(tag="智能体")))
+        self.assertIn("Agent（topic，别名 智能体，共 1 条）", text)
+        self.assertIn("`mem01`", text)
+        self.assertIn("发布 2026-03-01", text)
+        fallback = asyncio.run(mcp_server.list_by_tag(mcp_server.TagFilterInput(tag="测试")))
+        self.assertIn("不在词表中", fallback)
+
+    def test_get_note_by_code_shows_metadata(self) -> None:
+        text = asyncio.run(mcp_server.get_note_by_code("trd01"))
+        self.assertIn("**发布时间**: 2025-12-02", text)
+        self.assertIn("**领域 / 时效**: 交易", text)
+
     def test_stats_reports_index_state(self) -> None:
         self._build_index()
         text = asyncio.run(mcp_server.knowledge_stats())
         self.assertIn("**总笔记数**: 3", text)
         self.assertIn("章节索引", text)
         self.assertIn("待向量化 0", text)
+        self.assertIn("**词表**: 1 个规范条目", text)
 
 
 if __name__ == "__main__":

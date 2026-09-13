@@ -53,6 +53,8 @@ from app.services.video_frames import (
 )
 from app.database.knowledge_store import KnowledgeAsset, KnowledgeStore, KnowledgeEntry
 from app.database.note_index import NoteIndex
+from app.database.vocabulary import VocabularyStore
+from app.services.note_tagging import classify_note, link_note_tags, resolve_tags
 from app.database.model_usage_store import (
     bind_model_usage_context,
     get_model_usage_store,
@@ -86,6 +88,8 @@ async def _embed_for_index(texts):
 
 # 章节级检索索引：笔记入库后在后台切分并向量化，失败不影响交付。
 note_index = NoteIndex(embed_fn=_embed_for_index)
+# 受控词表：标签调用把笔记映射到规范条目，新条目只在词表确实没有时创建。
+vocabulary = VocabularyStore()
 
 
 async def _index_note_in_background(entry_id: int) -> None:
@@ -151,6 +155,7 @@ class PendingTask:
     parsed_video_id: str = ""
     parsed_video_path: str = ""
     parsed_media_url: str = ""
+    parsed_published_at: str = ""
 
 
 @dataclass
@@ -547,6 +552,7 @@ async def _process_task_init(
         task.parsed_author = video_info["author"] or "未知作者"
         task.parsed_video_path = video_info["video_path"]
         task.parsed_media_url = video_info.get("video_url", "")
+        task.parsed_published_at = video_info.get("published_at", "") or ""
 
         # 查重 (Title + Author)
         duplicates = await asyncio.to_thread(
@@ -637,11 +643,27 @@ async def _execute_summary_task(
                     summary = strip_video_frame_markers_for_storage(
                         summary_result.markdown
                     )
-                    tags = await generate_tags_with_ai(
+                    classification = await classify_note(
                         summary,
                         task.parsed_title,
                         task.parsed_author,
+                        vocabulary=vocabulary,
                     )
+                    if classification is not None:
+                        applied_tags = await asyncio.to_thread(
+                            resolve_tags, classification, vocabulary=vocabulary
+                        )
+                        tags = ",".join(applied_tags.canonical_names)
+                        domain, temporality = classification.domain, classification.temporality
+                    else:
+                        # 分类失败时退回自由标签，只丢失 domain/temporality，可用 scripts/retag_notes.py 补。
+                        applied_tags = None
+                        domain = temporality = ""
+                        tags = await generate_tags_with_ai(
+                            summary,
+                            task.parsed_title,
+                            task.parsed_author,
+                        )
                 storage_summary, persisted_frames = await asyncio.to_thread(
                     persist_video_frame_markers_for_storage,
                     summary_result.markdown,
@@ -677,6 +699,9 @@ async def _execute_summary_task(
                     user_requirement=req,
                     duration_seconds=summary_result.diagnostics.duration_seconds or 0.0,
                     video_code=video_code,
+                    published_at=task.parsed_published_at,
+                    domain=domain,
+                    temporality=temporality,
                 )
                 entry_id = await asyncio.to_thread(
                     knowledge_db.save,
@@ -684,6 +709,13 @@ async def _execute_summary_task(
                     allow_overwrite,
                     knowledge_assets,
                 )
+                if applied_tags is not None:
+                    try:
+                        await asyncio.to_thread(
+                            link_note_tags, entry_id, applied_tags, vocabulary=vocabulary
+                        )
+                    except Exception:
+                        logger.exception("词表关联失败: note=%s（可用 scripts/retag_notes.py 补）", entry_id)
                 _spawn_background(_index_note_in_background(entry_id))
 
                 pdf_path = os.path.join(os.path.dirname(task.parsed_video_path), "summary.pdf")

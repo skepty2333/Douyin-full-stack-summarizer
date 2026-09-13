@@ -40,6 +40,7 @@ from app.services.note_chunker import chunk_note, snippet
 logger = logging.getLogger(__name__)
 
 EmbedFn = Callable[[Sequence[str]], Awaitable[list[list[float]]]]
+AliasGroupsFn = Callable[[], dict[str, tuple[str, ...]]]
 
 RRF_K = 60
 VECTOR_CANDIDATES = 200
@@ -66,6 +67,9 @@ class ChunkRow:
     tags: str
     created_at: str
     timestamp: str
+    published_at: str = ""
+    domain: str = ""
+    temporality: str = ""
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,9 @@ class NoteHit:
     matched_chunks: int
     channels: tuple[str, ...]
     best_cosine: Optional[float] = None
+    published_at: str = ""
+    domain: str = ""
+    temporality: str = ""
 
 
 @dataclass(frozen=True)
@@ -159,12 +166,16 @@ class NoteIndex:
         db_path: str = KNOWLEDGE_DB_PATH,
         *,
         embed_fn: Optional[EmbedFn] = None,
+        alias_groups_fn: Optional[AliasGroupsFn] = None,
         model: str = EMBEDDING_MODEL,
         dimensions: int = EMBEDDING_DIMENSIONS,
         batch_size: int = EMBEDDING_BATCH_SIZE,
     ):
         self.db_path = db_path
         self._embed_fn = embed_fn
+        # Optional vocabulary hook: a query term that is a known alias also
+        # matches its canonical name and sibling aliases (智能体 ↔ Agent).
+        self._alias_groups_fn = alias_groups_fn
         self.model = model
         self.dimensions = int(dimensions)
         self.batch_size = max(1, int(batch_size))
@@ -409,11 +420,14 @@ class NoteIndex:
                     tags=str(r["tags"] or ""),
                     created_at=str(r["created_at"] or ""),
                     timestamp=str(r["timestamp"] or ""),
+                    published_at=str(r["published_at"] or ""),
+                    domain=str(r["domain"] or ""),
+                    temporality=str(r["temporality"] or ""),
                 )
                 for r in conn.execute(
                     """SELECT c.id, c.knowledge_id, c.chunk_index, c.heading_path, c.text,
                               c.embed_text_hash, k.video_code, k.title, k.author, k.tags,
-                              k.created_at, k.timestamp
+                              k.created_at, k.timestamp, k.published_at, k.domain, k.temporality
                        FROM note_chunks c JOIN knowledge k ON k.id = c.knowledge_id
                        ORDER BY c.knowledge_id, c.chunk_index"""
                 )
@@ -471,9 +485,24 @@ class NoteIndex:
             self._query_cache.popitem(last=False)
         return vector
 
-    @staticmethod
+    def _expand_terms(self, terms: list[str]) -> dict[str, tuple[str, ...]]:
+        """term -> every spelling to look for (itself plus its vocabulary group)."""
+        groups: dict[str, tuple[str, ...]] = {}
+        if self._alias_groups_fn is not None:
+            try:
+                groups = self._alias_groups_fn()
+            except Exception:
+                logger.exception("读取别名表失败，关键词通道不做同义扩展")
+                groups = {}
+        expanded: dict[str, tuple[str, ...]] = {}
+        for term in terms:
+            key = re.sub(r"\s+", "", term).lower()
+            variants = [term] + [name.lower() for name in groups.get(key, ())]
+            expanded[term] = tuple(dict.fromkeys(v for v in variants if v))
+        return expanded
+
     def _keyword_scores(
-        rows: list[ChunkRow], terms: list[str], *, require_all: bool
+        self, rows: list[ChunkRow], terms: list[str], *, require_all: bool
     ) -> dict[int, float]:
         """Row index -> keyword score; ``require_all`` filters at note level.
 
@@ -485,9 +514,12 @@ class NoteIndex:
             return {}
         haystacks = [f"{row.heading_path}\n{row.text}".lower() for row in rows]
         total = max(1, len(rows))
+        variants = self._expand_terms(terms)
         weights = {}
         for term in terms:
-            frequency = sum(1 for haystack in haystacks if term in haystack)
+            frequency = sum(
+                1 for haystack in haystacks if any(v in haystack for v in variants[term])
+            )
             weights[term] = math.log(1.0 + total / (1.0 + frequency))
         note_terms: dict[int, set[str]] = {}
         chunk_terms: dict[int, tuple[float, set[str]]] = {}
@@ -499,14 +531,15 @@ class NoteIndex:
             found: set[str] = set()
             for term in terms:
                 weight = weights[term]
+                spellings = variants[term]
                 hit = False
-                if term in haystack:
+                if any(v in haystack for v in spellings):
                     score += weight
                     hit = True
-                if term in title:
+                if any(v in title for v in spellings):
                     score += 0.5 * weight
                     hit = True
-                if term in tags:
+                if any(v in tags for v in spellings):
                     score += 0.5 * weight
                     hit = True
                 if hit:
@@ -525,16 +558,24 @@ class NoteIndex:
         return {index: score for index, (score, _) in chunk_terms.items()}
 
     async def _fused_chunks(
-        self, query: str, *, require_all_terms: bool
+        self, query: str, *, require_all_terms: bool, domain: Optional[str] = None
     ) -> tuple[list[ChunkHit], _Cache, bool, Optional[np.ndarray]]:
         query = (query or "").strip()[:MAX_QUERY_CHARS]
         cache = await asyncio.to_thread(self._load)
         rows = cache.rows
         if not query or not rows:
             return [], cache, self.semantic_available, None
+        domain = (domain or "").strip().lower() or None
+        in_domain = (
+            {index for index, row in enumerate(rows) if row.domain == domain}
+            if domain is not None
+            else None
+        )
 
         terms = split_terms(query)
         keyword = self._keyword_scores(rows, terms, require_all=require_all_terms)
+        if in_domain is not None:
+            keyword = {index: score for index, score in keyword.items() if index in in_domain}
         keyword_rank = sorted(
             keyword.items(), key=lambda item: (-item[1], rows[item[0]].knowledge_id, rows[item[0]].chunk_index)
         )
@@ -554,6 +595,8 @@ class NoteIndex:
                     break  # sorted descending: everything after is weaker
                 row_index = cache.vector_rows[int(pos)]
                 if allowed_rows is not None and row_index not in allowed_rows:
+                    continue
+                if in_domain is not None and row_index not in in_domain:
                     continue
                 vector_rank.append((row_index, cosine))
 
@@ -579,10 +622,17 @@ class NoteIndex:
         return hits, cache, semantic_ok, query_vector
 
     async def search(
-        self, query: str, *, limit: int = 10, require_all_terms: bool = False
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        require_all_terms: bool = False,
+        domain: Optional[str] = None,
     ) -> SearchResult:
         """Rank notes by their best chunks; each note appears once."""
-        hits, _, semantic_ok, _ = await self._fused_chunks(query, require_all_terms=require_all_terms)
+        hits, _, semantic_ok, _ = await self._fused_chunks(
+            query, require_all_terms=require_all_terms, domain=domain
+        )
         grouped: "OrderedDict[int, list[ChunkHit]]" = OrderedDict()
         for hit in hits:
             grouped.setdefault(hit.chunk.knowledge_id, []).append(hit)
@@ -608,6 +658,9 @@ class NoteIndex:
                     matched_chunks=len(chunk_hits),
                     channels=channels,
                     best_cosine=best.cosine,
+                    published_at=best.chunk.published_at,
+                    domain=best.chunk.domain,
+                    temporality=best.chunk.temporality,
                 )
             )
         notes.sort(key=lambda note: (-note.score, -note.matched_chunks))
@@ -625,9 +678,12 @@ class NoteIndex:
         max_per_note: int = 3,
         max_sections: int = 40,
         require_all_terms: bool = False,
+        domain: Optional[str] = None,
     ) -> CollectResult:
         """Pick diverse, relevant sections up to a character budget."""
-        hits, cache, semantic_ok, _ = await self._fused_chunks(query, require_all_terms=require_all_terms)
+        hits, cache, semantic_ok, _ = await self._fused_chunks(
+            query, require_all_terms=require_all_terms, domain=domain
+        )
         selected: list[CollectedSection] = []
         selected_vectors: list[np.ndarray] = []
         per_note: dict[int, int] = {}

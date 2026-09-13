@@ -21,6 +21,7 @@ from mcp.server.transport_security import (
 from pydantic import BaseModel, Field
 from app.database.knowledge_store import KnowledgeStore
 from app.database.note_index import NoteIndex, NoteHit
+from app.database.vocabulary import VocabularyStore
 from app.services.aliyun_client import aliyun_client
 from app.config import (
     EMBEDDING_DIMENSIONS,
@@ -46,8 +47,22 @@ async def _embed_query(texts):
     )
 
 
+# 受控词表：查询词命中别名时同时匹配规范名与其余别名（智能体 ↔ Agent）。
+vocabulary = VocabularyStore(KNOWLEDGE_DB_PATH)
+
 # 章节级混合检索索引（派生数据，可用 scripts/build_note_index.py 重建）。
-index = NoteIndex(KNOWLEDGE_DB_PATH, embed_fn=_embed_query)
+index = NoteIndex(
+    KNOWLEDGE_DB_PATH,
+    embed_fn=_embed_query,
+    alias_groups_fn=lambda: vocabulary.alias_groups(),
+)
+
+DOMAIN_LABELS = {"ai": "AI", "trading": "交易", "life": "生活", "other": "其他"}
+TEMPORALITY_LABELS = {
+    "stable": "",
+    "version_sensitive": "版本敏感",
+    "time_bound": "时效性",
+}
 
 # 默认只监听本机，并保留 FastMCP 的 DNS rebinding 防护。
 # 如需远程访问，请通过带认证的反向代理或受控隧道暴露，
@@ -97,15 +112,29 @@ mcp = FastMCP(
 # ======================== Tool: Search ========================
 
 def _note_date(item) -> str:
+    """Publish date when known (抖音 create_time), otherwise ingest date."""
+    published = getattr(item, "published_at", "") or ""
+    if published:
+        return f"发布 {published[:10]}"
     stamp = getattr(item, "timestamp", None) or getattr(item, "created_at", "")
-    return (stamp or "")[:10]
+    return f"入库 {(stamp or '')[:10]}"
 
 
-def _format_note_hits(query: str, hits: list[NoteHit], *, semantic: bool, heading: str) -> str:
+def _temporality_badge(item) -> str:
+    return TEMPORALITY_LABELS.get(getattr(item, "temporality", "") or "", "")
+
+
+def _format_note_hits(
+    query: str, hits: list[NoteHit], *, semantic: bool, heading: str, domain: str = ""
+) -> str:
     channel_note = "语义 + 关键词" if semantic else "仅关键词（语义通道暂不可用）"
-    lines = [f"## {heading}: \"{query}\"（{len(hits)} 条 · {channel_note}）\n"]
+    scope = f" · 仅 {DOMAIN_LABELS.get(domain, domain)} 领域" if domain else ""
+    lines = [f"## {heading}: \"{query}\"（{len(hits)} 条 · {channel_note}{scope}）\n"]
     for position, hit in enumerate(hits, 1):
-        extras = [f"入库 {_note_date(hit)}", f"命中 {hit.matched_chunks} 段"]
+        extras = [_note_date(hit), f"命中 {hit.matched_chunks} 段"]
+        badge = _temporality_badge(hit)
+        if badge:
+            extras.append(badge)
         if hit.best_cosine is not None:
             extras.append(f"相似 {hit.best_cosine:.2f}")
         lines.append(
@@ -115,6 +144,7 @@ def _format_note_hits(query: str, hits: list[NoteHit], *, semantic: bool, headin
         lines.append(f"   ▸ {section} — {hit.best_snippet}")
     lines.append(
         "\n> 读相关段落用 `collect_sections`；读整篇用 `get_note_by_code`（视频码）。"
+        "标注“版本敏感”的内容绑定具体产品版本，“时效性”的内容是事件或行情，引用时注意发布日期。"
     )
     return "\n".join(lines)
 
@@ -146,6 +176,11 @@ class SearchInput(BaseModel):
         description="自然语言问题或关键词，中英文均可；多个关键词用空格分隔。语义与关键词两路召回后融合排序。",
     )
     limit: int = Field(default=10, ge=1, le=30, description="返回笔记数量上限（每条笔记只出现一次）")
+    domain: str = Field(
+        default="",
+        pattern=r"^(ai|trading|life|other)?$",
+        description="可选领域过滤：ai（人工智能与编程）、trading（交易与投资）、life（学习/健身/职业）、other",
+    )
 
 
 @mcp.tool(name="search_notes")
@@ -160,11 +195,15 @@ async def search_notes(params: SearchInput) -> str:
         if not rows:
             return f"未找到与 \"{params.query}\" 相关的笔记。"
         return _legacy_search_text(params.query, rows, "搜索结果")
-    result = await index.search(params.query, limit=params.limit)
+    result = await index.search(params.query, limit=params.limit, domain=params.domain or None)
     if not result.notes:
         return f"未找到与 \"{params.query}\" 相关的笔记。"
     return _format_note_hits(
-        params.query, result.notes, semantic=result.semantic_available, heading="搜索结果"
+        params.query,
+        result.notes,
+        semantic=result.semantic_available,
+        heading="搜索结果",
+        domain=params.domain,
     )
 
 
@@ -204,6 +243,11 @@ class CollectSectionsInput(BaseModel):
         default=12000, ge=1000, le=40000, description="返回正文总字数预算（默认 12000 字，约 8K token）"
     )
     max_per_note: int = Field(default=3, ge=1, le=8, description="每条笔记最多贡献几个段落")
+    domain: str = Field(
+        default="",
+        pattern=r"^(ai|trading|life|other)?$",
+        description="可选领域过滤：ai / trading / life / other",
+    )
 
 
 @mcp.tool(name="collect_sections")
@@ -215,7 +259,10 @@ async def collect_sections(params: CollectSectionsInput) -> str:
     if not await asyncio.to_thread(_index_ready):
         return "章节索引未建立，无法汇集段落；请先运行 scripts/build_note_index.py。"
     result = await index.collect(
-        params.query, max_chars=params.max_chars, max_per_note=params.max_per_note
+        params.query,
+        max_chars=params.max_chars,
+        max_per_note=params.max_per_note,
+        domain=params.domain or None,
     )
     if not result.sections:
         return f"未找到与 \"{params.query}\" 相关的段落。"
@@ -229,8 +276,10 @@ async def collect_sections(params: CollectSectionsInput) -> str:
         chunk = section.chunk
         if chunk.knowledge_id != current:
             current = chunk.knowledge_id
+            badge = _temporality_badge(chunk)
             lines.append(
-                f"\n### `{chunk.video_code}` {chunk.title[:60]} — {chunk.author} · 入库 {_note_date(chunk)}"
+                f"\n### `{chunk.video_code}` {chunk.title[:60]} — {chunk.author} · {_note_date(chunk)}"
+                + (f" · {badge}" if badge else "")
             )
         lines.append(f"\n#### {chunk.heading_path or '概述'}\n\n{chunk.text}")
     lines.append("\n\n> 段落按相关性挑选并去重，不是笔记全文；需要上下文时用 `get_note_by_code`。")
@@ -257,6 +306,7 @@ async def get_note(params: GetNoteInput) -> str:
         f"- **标签**: {entry['tags']}\n"
         f"- **创建时间**: {entry.get('timestamp') or entry['created_at']}\n"
     )
+    header += _metadata_lines(entry)
     if entry.get('user_requirement'):
         header += f"- **用户要求**: {entry['user_requirement']}\n"
     assets = await asyncio.to_thread(store.list_assets, entry["id"])
@@ -267,6 +317,17 @@ async def get_note(params: GetNoteInput) -> str:
         )
     header += "\n---\n\n"
     return header + entry['summary_markdown']
+
+
+def _metadata_lines(entry: dict) -> str:
+    lines = ""
+    if entry.get("published_at"):
+        lines += f"- **发布时间**: {entry['published_at'][:10]}\n"
+    domain = DOMAIN_LABELS.get(entry.get("domain") or "", "")
+    badge = TEMPORALITY_LABELS.get(entry.get("temporality") or "", "")
+    if domain or badge:
+        lines += f"- **领域 / 时效**: {domain or '未分类'}{(' · ' + badge) if badge else ''}\n"
+    return lines
 
 
 @mcp.tool(name="get_note_by_code")
@@ -284,6 +345,7 @@ async def get_note_by_code(video_code: str) -> str:
         f"- **标签**: {entry['tags']}\n"
         f"- **创建时间**: {entry.get('timestamp') or entry['created_at']}\n"
     )
+    header += _metadata_lines(entry)
     if entry.get('user_requirement'):
         header += f"- **用户要求**: {entry['user_requirement']}\n"
     assets = await asyncio.to_thread(store.list_assets, entry["id"])
@@ -386,16 +448,34 @@ class TagFilterInput(BaseModel):
 
 @mcp.tool(name="list_by_tag")
 async def list_by_tag(params: TagFilterInput) -> str:
-    """按标签筛选笔记。"""
-    notes = await asyncio.to_thread(store.list_by_tag, params.tag, params.limit)
+    """按规范标签列出笔记；别名（如 智能体、龙虾）自动归到规范名（Agent、OpenClaw）。"""
+    entry = await asyncio.to_thread(vocabulary.resolve, params.tag)
+    if entry is not None:
+        note_ids = await asyncio.to_thread(vocabulary.notes_for_entry, entry.id)
+        notes = []
+        for note_id in note_ids:
+            note = await asyncio.to_thread(store.get_by_id, note_id)
+            if note:
+                notes.append(note)
+        notes.sort(key=lambda n: (n.get("published_at") or n.get("created_at") or ""), reverse=True)
+        notes = notes[: params.limit]
+        label = f"{entry.canonical}（{entry.kind}"
+        if entry.aliases:
+            label += f"，别名 {' / '.join(entry.aliases[:5])}"
+        label += f"，共 {entry.note_count} 条）"
+    else:
+        notes = await asyncio.to_thread(store.list_by_tag, params.tag, params.limit)
+        label = f"\"{params.tag}\"（不在词表中，按子串匹配）"
     if not notes:
         return f"未找到包含标签 \"{params.tag}\" 的笔记。"
 
-    lines = [f"## 标签 \"{params.tag}\" 相关笔记 ({len(notes)} 条)\n"]
+    lines = [f"## 标签 {label} 相关笔记 ({len(notes)} 条)\n"]
     for n in notes:
+        date = f"发布 {n['published_at'][:10]}" if n.get("published_at") else f"入库 {(n.get('timestamp') or n['created_at'])[:10]}"
+        badge = TEMPORALITY_LABELS.get(n.get("temporality") or "", "")
         lines.append(
-            f"- **[{n['id']}]** {n['title']} — _{n['author']}_ "
-            f"({(n.get('timestamp') or n['created_at'])[:10]})"
+            f"- `{n['video_code']}` {n['title'][:60]} — _{n['author']}_ · {date}"
+            + (f" · {badge}" if badge else "")
         )
     return "\n".join(lines)
 
@@ -420,6 +500,14 @@ async def knowledge_stats() -> str:
         )
     except Exception:
         logger.exception("读取章节索引状态失败")
+    try:
+        v = await asyncio.to_thread(vocabulary.stats)
+        text += (
+            f"- **词表**: {v['active_entries']} 个规范条目 / {v['aliases']} 个别名；"
+            f"已归一标签的笔记 {v['tagged_notes']} / {v['notes']}\n"
+        )
+    except Exception:
+        logger.exception("读取词表状态失败")
     return text
 
 

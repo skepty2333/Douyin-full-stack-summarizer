@@ -9,6 +9,7 @@ import time
 import uuid
 import httpx
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlencode, urlparse
 from app.config import TEMP_DIR, TEMP_FILE_TTL_HOURS
@@ -301,6 +302,43 @@ async def _fetch_aweme_detail(
     return None
 
 
+def _publish_time(item: dict[str, Any]) -> str:
+    """ISO-8601 UTC publish time from Douyin's ``create_time`` (unix seconds)."""
+    raw = item.get("create_time")
+    if isinstance(raw, str) and raw.strip().isdigit():
+        raw = int(raw.strip())
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return ""
+    if raw > 1e12:  # defensively accept milliseconds
+        raw = raw / 1000
+    if not (946_684_800 <= raw <= 4_102_444_800):  # 2000-01-01 .. 2100-01-01
+        return ""
+    return datetime.fromtimestamp(raw, tz=timezone.utc).isoformat()
+
+
+async def resolve_metadata(share_url: str) -> dict:
+    """Resolve title, author, video id and publish time without downloading."""
+    video_url, title, author, video_id, published_at = None, "未知标题", "未知作者", "", ""
+    async with httpx.AsyncClient(headers=MOBILE_HEADERS, follow_redirects=True, timeout=30) as client:
+        resp = await client.get(share_url)
+        resp.raise_for_status()
+        video_id = _extract_video_id(str(resp.url))
+        if not video_id:
+            raise ValueError("无法提取视频ID")
+        item = _extract_router_item(resp.text)
+        if item is None:
+            item = await _fetch_aweme_detail(client, video_id)
+        if item:
+            title = item.get("desc") or title
+            author = (item.get("author") or {}).get("nickname") or author
+            published_at = _publish_time(item)
+            video_url = _select_video_url(item)
+    return {
+        "video_id": video_id, "title": title, "author": author,
+        "published_at": published_at, "video_url": video_url,
+    }
+
+
 def _job_directory(job_id: str) -> Path:
     """Return an isolated, validated temporary directory for one job."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", job_id):
@@ -318,7 +356,7 @@ async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> 
     work_dir = _job_directory(job_id)
     logger.info("解析抖音分享链接: host=%s", urlparse(share_url).hostname or "unknown")
 
-    video_url, title, author, video_id = None, "未知标题", "未知作者", ""
+    video_url, title, author, video_id, published_at = None, "未知标题", "未知作者", "", ""
 
     async with httpx.AsyncClient(headers=MOBILE_HEADERS, follow_redirects=True, timeout=30) as client:
         try:
@@ -339,6 +377,7 @@ async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> 
             if item:
                 title = item.get("desc") or title
                 author = (item.get("author") or {}).get("nickname") or author
+                published_at = _publish_time(item)
                 video_url = _select_video_url(item)
             else:
                 logger.warning("抖音作品详情中未找到有效视频信息")
@@ -354,6 +393,7 @@ async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> 
 
     return {
         "video_id": video_id, "title": title, "author": author,
+        "published_at": published_at,
         "video_path": video_path, "video_url": video_url, "job_id": job_id,
         "work_dir": str(work_dir),
     }

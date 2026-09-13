@@ -118,8 +118,11 @@ flowchart TD
 | `app/utils/wechat_crypto.py` | 企业微信回调签名与 AES 加解密。 |
 | `app/database/knowledge_store.py` | SQLite 表、FTS5 索引、`knowledge_assets` 图片清单、内容哈希校验、读写、查重和旧版搜索。 |
 | `app/services/note_chunker.py` | 按标题把笔记 Markdown 切成章节块，生成展示文本与向量化文本。 |
-| `app/database/note_index.py` | `note_chunks` / `chunk_embeddings` 派生表、向量补算、语义 + 关键词混合检索与段落汇集。 |
+| `app/database/note_index.py` | `note_chunks` / `chunk_embeddings` 派生表、向量补算、语义 + 关键词混合检索（含别名扩展与领域过滤）与段落汇集。 |
+| `app/database/vocabulary.py` | 受控词表：规范条目、别名归一、合并 / 重命名、笔记关联与计数。 |
+| `app/services/note_tagging.py` | 分类与标签调用：domain / temporality / 词表映射的 JSON 输出与校验。 |
 | `scripts/build_note_index.py` | 建立或刷新章节索引的幂等脚本。 |
+| `scripts/seed_vocabulary.py`、`scripts/retag_notes.py`、`scripts/backfill_publish_dates.py` | 种子词表生成、全库重打标签、发布时间回填。 |
 | `mcp_server.py` | Streamable HTTP / stdio MCP 服务与 10 个文字/图片知识库工具。 |
 
 视频页面由 `httpx` 直接请求并读取 `_ROUTER_DATA`，项目当前不依赖 `yt-dlp` 完成解析。
@@ -268,7 +271,7 @@ Stage2 在全部时长档都关闭思考，并按时长限制输出 Token 与备
 
 一般措辞瑕疵不打断正文；只有会明显误导读者的问题才在准确呈现视频原意后，以简短“补充说明”处理。只有实际采用外部资料时才列参考资料。终稿不展示搜索、核查、纠正或编辑过程。
 
-`qwen3.7-flash` 随后生成最多 10 个去重标签。若模型失败或返回空内容，系统从最终 Markdown 本地提取关键词，保证标签故障不阻塞笔记入库。
+`qwen3.7-flash` 随后对笔记做一次分类与标签调用（`app/services/note_tagging.py`），输出 JSON：`domain`（ai / trading / life / other）、`temporality`（stable / version_sensitive / time_bound）和 3–6 个标签。提示词里注入当前受控词表（规范名、类型、别名），要求优先使用规范名，只有词表确实没有合适条目时才新建，并给新名标注 `kind`（topic / entity / content_type）。返回的标签经别名表归一后写入 `note_tags`，`knowledge.tags` 只保留规范名的逗号列表供展示与旧版匹配。分类调用失败时退回旧的自由标签提示词，笔记照常入库，只是缺少 `domain` / `temporality` 与词表关联，之后可用 `scripts/retag_notes.py` 补齐。
 
 ### 4.6 PDF 交付与矢量公式
 
@@ -426,7 +429,10 @@ curl -fsS http://127.0.0.1:8080/ready
 | `tags` | `qwen3.7-flash` 或本地降级逻辑生成的标签 |
 | `user_requirement` | 用户的特别要求 |
 | `video_code` | 唯一 5 位视频码 |
-| `created_at`、`timestamp` | 创建时间 |
+| `created_at`、`timestamp` | 入库时间 |
+| `published_at` | 抖音发布时间（详情 `create_time`，ISO-8601 UTC）；与入库时间分开保存，旧记录用 `scripts/backfill_publish_dates.py` 回填 |
+| `domain` | ai / trading / life / other，检索可按此过滤 |
+| `temporality` | stable / version_sensitive / time_bound，结果中以"版本敏感 / 时效性"标注，不做隐式时间衰减 |
 
 `summary_markdown` 不保存 Base64、大文件或服务器路径。一个规范图片引用形如：
 
@@ -460,7 +466,21 @@ SQLite 使用 WAL 提高读写并存能力。旧的 FTS5 表仍由触发器同�
 
 `collect_sections` 按融合顺序挑选章节正文直到字数预算：每条笔记最多贡献若干段，与已选段落余弦 ≥ 0.92 的近重复段落被跳过，输出按笔记分组并标注视频码与章节路径。这是"把所有讲 X 的段落一次读完"的入口：20 条相关笔记的全文约 6.8 万字，而它们的相关章节通常 1 万字左右。
 
-索引是派生数据。首次部署或升级后运行 `venv/bin/python scripts/build_note_index.py` 建立（`--rebuild` 重切所有笔记、`--no-embed` 只切分、`--stats` 查看状态）；此后 Bot 在每条笔记入库后于后台切分并向量化，启动时补齐遗漏。标准 Markdown 的时间与 caption 保留在正文 alt 文本中，因此纯文本搜索和不支持图片的客户端仍能理解该视觉证据的基本含义；需要查看原图时再通过 MCP 按需读取。
+索引是派生数据。首次部署或升级后运行 `venv/bin/python scripts/build_note_index.py` 建立（`--rebuild` 重切所有笔记、`--no-embed` 只切分、`--stats` 查看状态）；此后 Bot 在每条笔记入库后于后台切分并向量化，启动时补齐遗漏。
+
+### 7.2 受控词表与标签归一
+
+自由标签会迅速碎片化：253 条笔记曾累积 1,775 个不同标签，87% 只出现一次，"Agent"有 40 种写法。`app/database/vocabulary.py` 用三张表替代：
+
+| 表 | 内容 |
+| :--- | :--- |
+| `vocabulary` | 规范条目：`canonical`、`kind`（topic / entity / content_type / vacuous）、`status`（active / merged / archived）、`merged_into`、`source`（seed / ai / user） |
+| `vocabulary_aliases` | 别名到条目的映射；匹配键为去空白、小写、去 `#` 的名称，因此 `AI Agent`、`ai agent`、`AIAgent` 落到同一条目；规范名本身也是一条别名 |
+| `note_tags` | 笔记与条目的多对多关联，随笔记删除级联删除 |
+
+`kind` 决定条目将来能否长成主题页：只有 topic 与 entity 有资格，内容形式（教程、评测）与空话永远只是标签。合并（`merge`）会把别名与笔记关联搬到目标条目并让旧条目保持可解析；重命名把旧名留作别名。
+
+种子词表由 `scripts/seed_vocabulary.py` 从现有标签一次性聚出（`qwen3.8-max`，`--dry-run` 只看提案，`--from FILE` 载入保存的提案），随后 `scripts/retag_notes.py` 对全部笔记重新分类打标签（默认只处理无词表关联的笔记，`--all` 处理全部）。查询时，命中别名的关键词同时匹配规范名与其余别名（智能体 ↔ Agent ↔ AI Agent），这是关键词通道的同义扩展。标准 Markdown 的时间与 caption 保留在正文 alt 文本中，因此纯文本搜索和不支持图片的客户端仍能理解该视觉证据的基本含义；需要查看原图时再通过 MCP 按需读取。
 
 ---
 
@@ -470,16 +490,16 @@ MCP 服务提供 10 个工具：
 
 | 工具 | 参数 | 作用 |
 | :--- | :--- | :--- |
-| `search_notes` | `query`, `limit`（默认 10，最多 30） | 章节级混合检索；每条笔记只出现一次，返回视频码、入库日期、命中章节数、相似度、最佳章节标题与片段。 |
-| `search_notes_precise` | `query`, `limit` | 所有关键词都必须命中同一条笔记的精确搜索，命中后按相关性排序。 |
-| `collect_sections` | `query`, `max_chars`（默认 12,000）, `max_per_note`（默认 3） | 汇集最相关的章节正文，跨笔记去重，按笔记分组返回。 |
+| `search_notes` | `query`, `limit`（默认 10，最多 30）, `domain`（可选） | 章节级混合检索；每条笔记只出现一次，返回视频码、发布日期（未知时为入库日期）、时效标注、命中章节数、相似度、最佳章节标题与片段。 |
+| `search_notes_precise` | `query`, `limit`, `domain` | 所有关键词都必须命中同一条笔记的精确搜索，命中后按相关性排序。 |
+| `collect_sections` | `query`, `max_chars`（默认 12,000）, `max_per_note`（默认 3）, `domain` | 汇集最相关的章节正文，跨笔记去重，按笔记分组返回。 |
 | `get_note` | `note_id` | 按数据库 ID 获取完整 Markdown 与元数据；存在图片时提示可按需读取。 |
 | `get_note_by_code` | `video_code` | 按 5 位视频码获取完整 Markdown；保留正文中的逻辑图片 URI。 |
 | `list_note_images` | `note_id` | 按展示顺序列出图片 ID、时间、caption 和 `knowledge-asset://` 引用，不暴露文件路径。 |
 | `get_note_image` | `video_code`, `asset_id` | 解析逻辑引用，校验清单、大小、JPEG 格式和 SHA-256 后返回 MCP `Image`。 |
 | `list_notes` | `limit`, `offset` | 分页列出最近笔记。 |
-| `list_by_tag` | `tag`, `limit` | 按标签筛选笔记。 |
-| `knowledge_stats` | 无 | 查看总笔记数、最新记录、数据库路径与章节索引状态。 |
+| `list_by_tag` | `tag`, `limit` | 按规范标签列出笔记；别名（智能体、龙虾）自动归到规范名，不在词表中的词退回子串匹配。 |
+| `knowledge_stats` | 无 | 查看总笔记数、最新记录、数据库路径、章节索引与词表状态。 |
 
 默认配置为：
 
