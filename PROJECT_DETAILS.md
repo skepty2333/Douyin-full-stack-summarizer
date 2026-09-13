@@ -1,6 +1,6 @@
 # 抖音全栈视频知识总结 Bot：项目详情
 
-本文档说明 `douyin-bot` 的当前系统边界、全阿里云百炼 AI 管线、任务生命周期、稳定性设计、知识库和 MCP 接口，供开发、部署与运维使用。
+本文档说明 `douyin-bot` 的当前系统边界、全阿里云百炼 AI 管线、任务生命周期、稳定性设计、知识库（章节检索、受控词表、自动生长的主题页）和 MCP 接口，供开发、部署与运维使用。
 
 ---
 
@@ -16,7 +16,8 @@
 6. 将终稿规范化为带时间和 caption 的标准 Markdown 图片引用，并把图片清单与元数据写入 SQLite。
 7. 将审核 JPEG 按 SHA-256 内容寻址持久化到 `KNOWLEDGE_ASSETS_DIR`，使图片知识不依赖临时 PDF。
 8. 把 PDF 作为企业微信交付格式渲染并发送；PDF 交付失败时降级为纯文字 Markdown。
-9. 通过 MCP Server 向受控客户端提供知识库搜索、读取、统计以及按需多模态图片读取能力。
+9. 入库后在后台把笔记切成章节并向量化，把标签归一到受控词表，并让聚集到足够密度的词表条目自动长成主题综述页（或让已有主题页重编译）。
+10. 通过 MCP Server 向受控客户端提供章节级混合检索、段落汇集、主题页读取与整理、笔记读取、统计以及按需多模态图片读取能力。
 
 当前解析器只支持抖音域名下的分享链接和视频页链接，不提供 TikTok 解析。
 
@@ -57,7 +58,7 @@ flowchart TD
         Research["Stage2 qwen3.7-plus<br/>完整逐字稿研究 + enable_search"]
         FrameReview["qwen3.8-max<br/>独立候选帧审核"]
         Final["Stage3 qwen3.8-max<br/>全量来源 + 候选帧终稿"]
-        Tag["qwen3.7-flash<br/>标签"]
+        Tag["qwen3.7-flash<br/>领域 / 时效 / 词表标签"]
 
         ASR -->|"成功"| Transcript
         ASR -->|"失败"| ASRFallback --> Transcript
@@ -80,11 +81,16 @@ flowchart TD
     FrameReview --> AssetPersist
 
     subgraph Data["持久化与检索"]
-        DB[("SQLite + WAL + FTS5<br/>knowledge_assets 清单")]
+        DB[("SQLite + WAL<br/>笔记 · 图片清单 · 章节与向量<br/>词表 · 主题页版本")]
         Blobs["KNOWLEDGE_ASSETS_DIR<br/>blobs/sha-prefix/sha256.jpg"]
+        Index["章节切分 + text-embedding-v4<br/>语义 + 关键词 RRF"]
+        Topics["主题出生 / 标脏 / 拆分<br/>qwen3.8-max 编译页面"]
         MCP["MCP Server<br/>127.0.0.1:8090"]
         Client["受控 MCP 客户端"]
 
+        DB --> Index
+        DB --> Topics
+        Index --> Topics
         MCP <--> DB
         MCP <-->|"按需校验读取"| Blobs
         Client <-->|"认证反向代理或受控隧道"| MCP
@@ -125,7 +131,7 @@ flowchart TD
 | `app/database/topics.py` | 主题与页面版本：出生、标脏、拆分为枢纽 / 子主题、合并建议、否决。 |
 | `app/services/topic_compiler.py` | 主题页编译：章节取材、引用校验、来源清单、增量重编译、超限拆分。 |
 | `scripts/seed_vocabulary.py`、`scripts/retag_notes.py`、`scripts/backfill_publish_dates.py`、`scripts/grow_topics.py` | 种子词表生成、全库重打标签、发布时间回填、主题整体生长。 |
-| `mcp_server.py` | Streamable HTTP / stdio MCP 服务与 10 个文字/图片知识库工具。 |
+| `mcp_server.py` | Streamable HTTP / stdio MCP 服务与 16 个检索、主题与图片工具。 |
 
 视频页面由 `httpx` 直接请求并读取 `_ROUTER_DATA`，项目当前不依赖 `yt-dlp` 完成解析。
 
@@ -577,10 +583,11 @@ chmod 600 .env
 - SQLite 适合单机部署；多实例横向扩展需要外部队列和共享数据库。
 - `/ready` 不验证百炼余额、模型权限或真实网络连通性，完整验证需要受控的端到端测试。
 - FileTrans 主路径可回退到本地切片 ASR；两条 ASR 路径都失败时任务无法生成笔记。
-- 联网研究、视觉增量和截图均可独立降级；可靠转写与终稿仍是生成笔记的必要阶段。
-- 多模态知识由 SQLite 清单和 `KNOWLEDGE_ASSETS_DIR` 两部分组成；只备份数据库或只复制 blob 目录都不是完整备份。
-- 抖音页面结构或反爬策略变化可能导致解析失败。
-- MCP 本身不承担公网认证，安全边界必须由 loopback、反向代理或隧道建立。
+- 联网研究、视觉增量、截图、分类标签、章节索引和主题生长均可独立降级；可靠转写与终稿仍是生成笔记的必要阶段。分类失败的笔记只缺领域 / 时效与词表关联，索引和主题失败可用脚本补齐。
+- 多模态知识由 SQLite 清单和 `KNOWLEDGE_ASSETS_DIR` 两部分组成；只备份数据库或只复制 blob 目录都不是完整备份。章节与向量可重建，词表、标签关联和主题页版本不能。
+- 主题页是模型从章节编译的派生层：结论带视频码可回溯，但编译质量、拆分归属和分类判断都可能出错；笔记本身不会被修改，页面可否决、可重编译、可回看旧版本。词表条目的合并与改名会改变标签归属，不可自动撤销。
+- 抖音页面结构或反爬策略变化可能导致解析失败；已下架的视频取不到发布时间，这类笔记在结果中显示入库时间。
+- MCP 本身不承担公网认证，安全边界必须由 loopback、反向代理或隧道建立；`compile_topic` / `veto_topic` / `rename_topic` / `merge_topics` 会写入知识库并触发付费编译。
 
 ---
 
@@ -596,7 +603,9 @@ chmod 600 .env
 6. MCP 仍监听 `127.0.0.1`，公网入口具有认证与 TLS。
 7. `KNOWLEDGE_ASSETS_DIR` 为绝对路径、权限受限且磁盘空间充足；备份任务同时覆盖 SQLite 与该目录。
 8. 使用一个包含界面、图表和公式的短视频验证句级时间戳、并行视觉/研究、确定性合并、截图审核、二/三级标题结构、规范图片 URI、内容寻址入库、MCP 按需取图和 PDF 交付。
-9. 如已启用用量观测，运行 `scripts/model_usage_report.py --days 1 --details`，确认七类调用可关联到同一 `job_id`/视频码，Token 或音频时长存在，费用未知项有明确原因。
+9. 如已启用用量观测，运行 `scripts/model_usage_report.py --days 1 --details`，确认各类调用（含 `classify_note`、`embedding_index`、`embedding_query`、`topic_compile`、`topic_split`）可关联到同一 `job_id`/视频码，Token 或音频时长存在，费用未知项有明确原因。
 10. 日志中没有 Key、Authorization 头、提示词、逐字稿、媒体 URL、资产绝对路径或完整异常响应。
+11. `scripts/build_note_index.py --stats` 显示待向量化为 0；`knowledge_stats` 中已归一标签的笔记数等于总笔记数；`scripts/grow_topics.py --list` 的版图与预期一致，合并建议已处理或有意保留。
+12. 用一条新视频验证入库后日志依次出现"章节索引完成"、主题标脏或出生、到阈值时"主题编译"，且 `read_topic` 能读到新版本。
 
-以上设计将模型供应链统一到阿里云百炼，并把 Markdown、图片清单和内容寻址 JPEG 作为可持续读取的多模态知识层；PDF 仅负责交付。任务隔离、容量控制、超时重试、完整性校验、健康检查和最小暴露面共同降低单机运行风险。
+以上设计将模型供应链统一到阿里云百炼，并把 Markdown、图片清单和内容寻址 JPEG 作为可持续读取的多模态知识层；PDF 仅负责交付。章节索引、受控词表和自动生长的主题页让新笔记不再是孤立文档，而是持续修正既有知识的来源。任务隔离、容量控制、超时重试、完整性校验、健康检查和最小暴露面共同降低单机运行风险。
