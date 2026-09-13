@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import sqlite3
 from collections import OrderedDict
@@ -42,6 +43,10 @@ EmbedFn = Callable[[Sequence[str]], Awaitable[list[list[float]]]]
 
 RRF_K = 60
 VECTOR_CANDIDATES = 200
+# Below this cosine the semantic channel is returning nearest neighbours, not
+# matches: on text-embedding-v4 unrelated sections of this corpus sit around
+# 0.30-0.38 while on-topic ones start near 0.47. Keyword hits are unaffected.
+MIN_SEMANTIC_COSINE = 0.40
 NEAR_DUPLICATE_COSINE = 0.92
 MAX_QUERY_CHARS = 200
 _TERM_SPLIT_RE = re.compile(r"[\s,，、;；]+")
@@ -470,27 +475,39 @@ class NoteIndex:
     def _keyword_scores(
         rows: list[ChunkRow], terms: list[str], *, require_all: bool
     ) -> dict[int, float]:
-        """Row index -> keyword score; ``require_all`` filters at note level."""
+        """Row index -> keyword score; ``require_all`` filters at note level.
+
+        Each term is weighted by its rarity (log-scaled inverse document
+        frequency over sections), so a distinctive product name outranks a
+        common word like 方法 that happens to appear in hundreds of sections.
+        """
         if not terms:
             return {}
+        haystacks = [f"{row.heading_path}\n{row.text}".lower() for row in rows]
+        total = max(1, len(rows))
+        weights = {}
+        for term in terms:
+            frequency = sum(1 for haystack in haystacks if term in haystack)
+            weights[term] = math.log(1.0 + total / (1.0 + frequency))
         note_terms: dict[int, set[str]] = {}
         chunk_terms: dict[int, tuple[float, set[str]]] = {}
         for index, row in enumerate(rows):
-            haystack = f"{row.heading_path}\n{row.text}".lower()
+            haystack = haystacks[index]
             title = row.title.lower()
             tags = row.tags.lower()
             score = 0.0
             found: set[str] = set()
             for term in terms:
+                weight = weights[term]
                 hit = False
                 if term in haystack:
-                    score += 1.0
+                    score += weight
                     hit = True
                 if term in title:
-                    score += 0.5
+                    score += 0.5 * weight
                     hit = True
                 if term in tags:
-                    score += 0.5
+                    score += 0.5 * weight
                     hit = True
                 if hit:
                     found.add(term)
@@ -532,10 +549,13 @@ class NoteIndex:
             order = order[np.argsort(-sims[order])]
             allowed_rows = set(keyword) if require_all_terms else None
             for pos in order:
+                cosine = float(sims[pos])
+                if cosine < MIN_SEMANTIC_COSINE:
+                    break  # sorted descending: everything after is weaker
                 row_index = cache.vector_rows[int(pos)]
                 if allowed_rows is not None and row_index not in allowed_rows:
                     continue
-                vector_rank.append((row_index, float(sims[pos])))
+                vector_rank.append((row_index, cosine))
 
         fused: dict[int, float] = {}
         channels: dict[int, set[str]] = {}

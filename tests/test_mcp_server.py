@@ -105,7 +105,13 @@ class MCPSearchToolTests(unittest.TestCase):
         self.original = (mcp_server.store, mcp_server.index)
         mcp_server.store, mcp_server.index = self.store, self.index
         notes = (
-            ("mem01", "Agent 记忆架构", "# Agent 记忆架构\n\n## 记忆分层\n\n长期记忆放数据库，短期记忆放上下文，记忆分层很重要。"),
+            (
+                "mem01",
+                "Agent 记忆架构",
+                "# Agent 记忆架构\n\n## 记忆分层\n\n长期记忆放数据库，短期记忆放上下文，记忆分层很重要。"
+                + "这一段刻意写得很长，用来验证搜索结果只返回片段而不是整段正文。" * 4
+                + "结尾句：全文结束标记。",
+            ),
             ("trd01", "止损的数学真相", "# 止损\n\n## 仓位公式\n\n止损决定单笔风险，仓位公式以止损为分母。"),
             ("cof01", "咖啡与心血管", "# 咖啡\n\n## 每天几杯\n\n两到三杯咖啡获益最大。"),
         )
@@ -138,7 +144,7 @@ class MCPSearchToolTests(unittest.TestCase):
         self.assertTrue(first.startswith("1. `mem01`"), first)
         self.assertIn("▸ 记忆分层", text)
         self.assertIn("collect_sections", text)
-        self.assertNotIn("长期记忆放数据库，短期记忆放上下文，记忆分层很重要。\n\n", text)  # no full bodies
+        self.assertNotIn("结尾句：全文结束标记。", text)  # snippet only, never the full section
 
     def test_precise_search_requires_every_term(self) -> None:
         self._build_index()

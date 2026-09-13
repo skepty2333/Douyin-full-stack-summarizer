@@ -235,6 +235,13 @@ class NoteIndexTests(unittest.TestCase):
         self.assertIn("mem01", codes)
         self.assertNotIn("dup01", codes)
 
+    def test_weak_semantic_neighbours_are_not_padded_in(self) -> None:
+        self._index_all()
+        # "serena" is only mentioned in one note; the other notes' vectors are
+        # nearly orthogonal to the query and must not fill the remaining slots.
+        result = asyncio.run(self.index.search("serena", limit=10))
+        self.assertEqual([note.video_code for note in result.notes], ["ser01"])
+
     def test_empty_query_returns_nothing(self) -> None:
         self._index_all()
         self.assertEqual(asyncio.run(self.index.search("   ")).notes, [])
