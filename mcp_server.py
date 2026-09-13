@@ -20,13 +20,34 @@ from mcp.server.transport_security import (
 )
 from pydantic import BaseModel, Field
 from app.database.knowledge_store import KnowledgeStore
-from app.config import KNOWLEDGE_DB_PATH, MCP_HOST, MCP_PORT
+from app.database.note_index import NoteIndex, NoteHit
+from app.services.aliyun_client import aliyun_client
+from app.config import (
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_MODEL,
+    KNOWLEDGE_DB_PATH,
+    MCP_HOST,
+    MCP_PORT,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-knowledge")
 
 # 初始化
 store = KnowledgeStore(KNOWLEDGE_DB_PATH)
+
+
+async def _embed_query(texts):
+    return await aliyun_client.embed(
+        model=EMBEDDING_MODEL,
+        texts=texts,
+        dimensions=EMBEDDING_DIMENSIONS,
+        operation="embedding_query",
+    )
+
+
+# 章节级混合检索索引（派生数据，可用 scripts/build_note_index.py 重建）。
+index = NoteIndex(KNOWLEDGE_DB_PATH, embed_fn=_embed_query)
 
 # 默认只监听本机，并保留 FastMCP 的 DNS rebinding 防护。
 # 如需远程访问，请通过带认证的反向代理或受控隧道暴露，
@@ -75,57 +96,144 @@ mcp = FastMCP(
 
 # ======================== Tool: Search ========================
 
+def _note_date(item) -> str:
+    stamp = getattr(item, "timestamp", None) or getattr(item, "created_at", "")
+    return (stamp or "")[:10]
+
+
+def _format_note_hits(query: str, hits: list[NoteHit], *, semantic: bool, heading: str) -> str:
+    channel_note = "语义 + 关键词" if semantic else "仅关键词（语义通道暂不可用）"
+    lines = [f"## {heading}: \"{query}\"（{len(hits)} 条 · {channel_note}）\n"]
+    for position, hit in enumerate(hits, 1):
+        extras = [f"入库 {_note_date(hit)}", f"命中 {hit.matched_chunks} 段"]
+        if hit.best_cosine is not None:
+            extras.append(f"相似 {hit.best_cosine:.2f}")
+        lines.append(
+            f"{position}. `{hit.video_code}` **{hit.title[:60]}** — {hit.author} · " + " · ".join(extras)
+        )
+        section = hit.best_heading or "概述"
+        lines.append(f"   ▸ {section} — {hit.best_snippet}")
+    lines.append(
+        "\n> 读相关段落用 `collect_sections`；读整篇用 `get_note_by_code`（视频码）。"
+    )
+    return "\n".join(lines)
+
+
+def _index_ready() -> bool:
+    try:
+        return index.stats()["chunks"] > 0
+    except Exception:
+        logger.exception("读取章节索引状态失败")
+        return False
+
+
+def _legacy_search_text(query: str, rows: list[dict], heading: str) -> str:
+    lines = [f"## {heading}: \"{query}\"（{len(rows)} 条 · 章节索引未建立，使用旧版匹配）\n"]
+    for r in rows:
+        lines.append(
+            f"- `{r['video_code']}` **{r['title'][:60]}** — {r['author']} · "
+            f"{(r.get('timestamp') or r['created_at'])[:10]} · 标签: {r['tags'][:80]}"
+        )
+    lines.append("\n> 运行 scripts/build_note_index.py 建立章节索引后可获得相关性排序。")
+    return "\n".join(lines)
+
+
 class SearchInput(BaseModel):
-    query: str = Field(..., min_length=1, max_length=200, description="搜索关键词，支持中文。支持多个关键词空格分隔，将匹配标签、标题和正文。")
-    limit: int = Field(default=100, ge=1, le=100, description="返回结果数量上限")
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="自然语言问题或关键词，中英文均可；多个关键词用空格分隔。语义与关键词两路召回后融合排序。",
+    )
+    limit: int = Field(default=10, ge=1, le=30, description="返回笔记数量上限（每条笔记只出现一次）")
 
 
 @mcp.tool(name="search_notes")
 async def search_notes(params: SearchInput) -> str:
-    """在知识库中搜索视频笔记。优先匹配标签，也搜索标题和正文。多个关键词用空格分隔。"""
-    results = await asyncio.to_thread(store.search, params.query, params.limit)
-    if not results:
-        return f"未找到与 \"{params.query}\" 相关的笔记。"
+    """按相关性搜索视频笔记，返回紧凑列表（视频码、标题、命中的章节和片段）。
 
-    lines = [f"## 搜索结果: \"{params.query}\" ({len(results)} 条)\n"]
-    for r in results:
-        lines.append(
-            f"### [{r['id']}] {r['title'][:60]}\n"
-            f"- **视频码**: `{r['video_code']}`\n"
-            f"- **作者**: {r['author']}\n"
-            f"- **标签**: {r['tags'][:120]}\n"
-            f"- **时间**: {r.get('timestamp') or r['created_at'][:19]}\n"
-            f"- **摘要**: {r.get('snippet', '')[:200]}\n"
-        )
-    lines.append("\n> 使用 `get_note` (ID) 或 `get_note_by_code` (视频码) 获取完整内容。")
-    return "\n".join(lines)
+    适合回答"哪些视频讲了 X"。要把所有讲 X 的段落一次读完，改用 collect_sections；
+    要读某一篇全文，用 get_note_by_code。
+    """
+    if not await asyncio.to_thread(_index_ready):
+        rows = await asyncio.to_thread(store.search, params.query, params.limit)
+        if not rows:
+            return f"未找到与 \"{params.query}\" 相关的笔记。"
+        return _legacy_search_text(params.query, rows, "搜索结果")
+    result = await index.search(params.query, limit=params.limit)
+    if not result.notes:
+        return f"未找到与 \"{params.query}\" 相关的笔记。"
+    return _format_note_hits(
+        params.query, result.notes, semantic=result.semantic_available, heading="搜索结果"
+    )
 
 
 # ======================== Tool: Precise Search ========================
 
 class PreciseSearchInput(BaseModel):
-    query: str = Field(..., min_length=1, max_length=200, description="搜索关键词，空格分隔。所有关键词必须同时出现才会命中。")
-    limit: int = Field(default=20, ge=1, le=100, description="返回结果数量上限")
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="空格分隔的关键词；每个关键词都必须在同一条笔记的标题、标签或正文中出现。",
+    )
+    limit: int = Field(default=10, ge=1, le=30, description="返回笔记数量上限")
 
 
 @mcp.tool(name="search_notes_precise")
 async def search_notes_precise(params: PreciseSearchInput) -> str:
-    """精确搜索：所有关键词必须同时出现在标签、标题或正文中（AND逻辑）。适合缩小范围、精确定位。"""
-    results = await asyncio.to_thread(store.search_precise, params.query, params.limit)
-    if not results:
+    """精确搜索：所有关键词都必须命中同一条笔记（AND 逻辑），命中后按相关性排序。适合已知产品名、术语时缩小范围。"""
+    if not await asyncio.to_thread(_index_ready):
+        rows = await asyncio.to_thread(store.search_precise, params.query, params.limit)
+        if not rows:
+            return f"未找到同时包含所有关键词 \"{params.query}\" 的笔记。"
+        return _legacy_search_text(params.query, rows, "精确搜索")
+    result = await index.search(params.query, limit=params.limit, require_all_terms=True)
+    if not result.notes:
         return f"未找到同时包含所有关键词 \"{params.query}\" 的笔记。"
+    return _format_note_hits(
+        params.query, result.notes, semantic=result.semantic_available, heading="精确搜索"
+    )
 
-    lines = [f"## 精确搜索: \"{params.query}\" ({len(results)} 条)\n"]
-    for r in results:
-        lines.append(
-            f"### [{r['id']}] {r['title'][:60]}\n"
-            f"- **视频码**: `{r['video_code']}`\n"
-            f"- **作者**: {r['author']}\n"
-            f"- **标签**: {r['tags'][:120]}\n"
-            f"- **时间**: {r.get('timestamp') or r['created_at'][:19]}\n"
-            f"- **摘要**: {r.get('snippet', '')[:200]}\n"
-        )
-    lines.append("\n> 使用 `get_note` (ID) 或 `get_note_by_code` (视频码) 获取完整内容。")
+
+# ======================== Tool: Collect Sections ========================
+
+class CollectSectionsInput(BaseModel):
+    query: str = Field(..., min_length=1, max_length=200, description="要汇总的问题或主题")
+    max_chars: int = Field(
+        default=12000, ge=1000, le=40000, description="返回正文总字数预算（默认 12000 字，约 8K token）"
+    )
+    max_per_note: int = Field(default=3, ge=1, le=8, description="每条笔记最多贡献几个段落")
+
+
+@mcp.tool(name="collect_sections")
+async def collect_sections(params: CollectSectionsInput) -> str:
+    """把知识库中与问题最相关的章节正文按预算汇集起来，跨笔记去重，供一次性通读或综合。
+
+    结果按笔记分组，每个段落标注视频码、章节标题，可回溯到 get_note_by_code。
+    """
+    if not await asyncio.to_thread(_index_ready):
+        return "章节索引未建立，无法汇集段落；请先运行 scripts/build_note_index.py。"
+    result = await index.collect(
+        params.query, max_chars=params.max_chars, max_per_note=params.max_per_note
+    )
+    if not result.sections:
+        return f"未找到与 \"{params.query}\" 相关的段落。"
+    channel_note = "语义 + 关键词" if result.semantic_available else "仅关键词（语义通道暂不可用）"
+    lines = [
+        f"## 相关段落: \"{params.query}\"（{len(result.sections)} 段 · {result.note_count} 条笔记 · "
+        f"{result.total_chars} 字 · {channel_note}）\n"
+    ]
+    current = None
+    for section in result.sections:
+        chunk = section.chunk
+        if chunk.knowledge_id != current:
+            current = chunk.knowledge_id
+            lines.append(
+                f"\n### `{chunk.video_code}` {chunk.title[:60]} — {chunk.author} · 入库 {_note_date(chunk)}"
+            )
+        lines.append(f"\n#### {chunk.heading_path or '概述'}\n\n{chunk.text}")
+    lines.append("\n\n> 段落按相关性挑选并去重，不是笔记全文；需要上下文时用 `get_note_by_code`。")
     return "\n".join(lines)
 
 
@@ -298,12 +406,21 @@ async def list_by_tag(params: TagFilterInput) -> str:
 async def knowledge_stats() -> str:
     """知识库统计。"""
     s = await asyncio.to_thread(store.stats)
-    return (
+    text = (
         f"## 知识库统计\n\n"
         f"- **总笔记数**: {s['total_entries']}\n"
         f"- **最新记录**: {s['latest_entry'] or '无'}\n"
         f"- **数据库路径**: {s['db_path']}\n"
     )
+    try:
+        i = await asyncio.to_thread(index.stats)
+        text += (
+            f"- **章节索引**: {i['indexed_notes']} 条笔记 / {i['chunks']} 段 / "
+            f"{i['vectors']} 个向量（待向量化 {i['pending_embeddings']}，{i['model']}@{i['dimensions']}）\n"
+        )
+    except Exception:
+        logger.exception("读取章节索引状态失败")
+    return text
 
 
 # ======================== Start ========================

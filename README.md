@@ -155,6 +155,7 @@ DASHSCOPE_NATIVE_BASE_URL=https://YOUR_WORKSPACE_ID.cn-beijing.maas.aliyuncs.com
 | ASR 回退 | `ASR_SEGMENT_SECONDS`、`ASR_MAX_FILE_MB`、`ASR_FILE_POLL_INTERVAL_SECONDS`、`ASR_FILE_TIMEOUT_SECONDS` |
 | 用量观测 | `MODEL_USAGE_LOG_ENABLED`、`MODEL_USAGE_DB_PATH` |
 | 数据与服务 | `TEMP_DIR`、`TEMP_FILE_TTL_HOURS`、`KNOWLEDGE_DB_PATH`、`KNOWLEDGE_ASSETS_DIR`、`SERVER_HOST`、`SERVER_PORT`、`MCP_HOST`、`MCP_PORT` |
+| 章节检索索引 | `EMBEDDING_MODEL`（默认 `text-embedding-v4`）、`EMBEDDING_DIMENSIONS`（默认 1024）、`EMBEDDING_BATCH_SIZE`（默认 10） |
 
 新部署默认让 Bot 和 MCP 都只监听 loopback，由反向代理承担 TLS 与公网边界。只有在已经具备安全组、防火墙或其他受控网络边界时，才应显式改为其他监听地址。
 
@@ -204,8 +205,9 @@ journalctl -u douyin-bot -u douyin-mcp -f
 
 | 工具 | 功能 |
 | :--- | :--- |
-| `search_notes` | 标签、标题和正文的宽松检索 |
-| `search_notes_precise` | 所有关键词必须命中的 AND 检索 |
+| `search_notes` | 章节级混合检索（语义向量 + 关键词，RRF 融合），每条笔记只出现一次，返回命中章节和片段 |
+| `search_notes_precise` | 所有关键词必须命中同一条笔记的 AND 检索，命中后按相关性排序 |
+| `collect_sections` | 把最相关的章节正文按字数预算汇集起来，跨笔记去重，供一次通读或综合 |
 | `get_note` | 按数据库 ID 读取完整 Markdown |
 | `get_note_by_code` | 按 5 位视频码读取完整 Markdown |
 | `list_note_images` | 按笔记 ID 列出截图 ID、时间、caption 和逻辑 URI |
@@ -214,7 +216,7 @@ journalctl -u douyin-bot -u douyin-mcp -f
 | `list_by_tag` | 按标签筛选笔记 |
 | `knowledge_stats` | 查看知识库统计 |
 
-多模态客户端应先读取 Markdown，只在需要核对视觉证据时调用 `list_note_images` 和 `get_note_image`，避免每次检索传输全部图片。MCP 自身不提供公网身份认证；远程访问应保持 `MCP_HOST=127.0.0.1`，通过带认证的 HTTPS 反向代理、VPN 或 SSH 隧道接入。
+推荐调用顺序：`search_notes` 找到候选 → `collect_sections` 一次读完所有相关段落 → 需要上下文时 `get_note_by_code` 读整篇。章节索引是派生数据，首次部署或升级后运行 `venv/bin/python scripts/build_note_index.py` 建立；此后 Bot 在每条笔记入库后自动切分并向量化，索引未建立时搜索自动退回旧版匹配。多模态客户端应先读取 Markdown，只在需要核对视觉证据时调用 `list_note_images` 和 `get_note_image`，避免每次检索传输全部图片。MCP 自身不提供公网身份认证；远程访问应保持 `MCP_HOST=127.0.0.1`，通过带认证的 HTTPS 反向代理、VPN 或 SSH 隧道接入。
 
 ## 数据与备份
 

@@ -10,6 +10,14 @@ import unittest
 
 import mcp_server
 from app.database.knowledge_store import KnowledgeAsset, KnowledgeEntry, KnowledgeStore
+from app.database.note_index import NoteIndex
+
+
+VOCAB = ["记忆", "止损", "咖啡"]
+
+
+async def toy_embed(texts):
+    return [[0.01 + text.lower().count(word) for word in VOCAB] for text in texts]
 
 
 class MCPImageToolTests(unittest.TestCase):
@@ -85,6 +93,90 @@ class MCPImageToolTests(unittest.TestCase):
 
         self.assertEqual(content.mimeType, "image/jpeg")
         self.assertEqual(base64.b64decode(content.data), self.payload)
+
+
+class MCPSearchToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        db_path = str(root / "knowledge.db")
+        self.store = KnowledgeStore(db_path, asset_root=str(root / "assets"))
+        self.index = NoteIndex(db_path, embed_fn=toy_embed, model="toy", dimensions=len(VOCAB))
+        self.original = (mcp_server.store, mcp_server.index)
+        mcp_server.store, mcp_server.index = self.store, self.index
+        notes = (
+            ("mem01", "Agent 记忆架构", "# Agent 记忆架构\n\n## 记忆分层\n\n长期记忆放数据库，短期记忆放上下文，记忆分层很重要。"),
+            ("trd01", "止损的数学真相", "# 止损\n\n## 仓位公式\n\n止损决定单笔风险，仓位公式以止损为分母。"),
+            ("cof01", "咖啡与心血管", "# 咖啡\n\n## 每天几杯\n\n两到三杯咖啡获益最大。"),
+        )
+        for code, title, markdown in notes:
+            self.store.save(
+                KnowledgeEntry(
+                    video_id=f"vid-{code}",
+                    title=title,
+                    author="offline",
+                    source_url=f"https://example.test/{code}",
+                    summary_markdown=markdown,
+                    tags="测试",
+                    video_code=code,
+                )
+            )
+
+    def tearDown(self) -> None:
+        mcp_server.store, mcp_server.index = self.original
+        self.temp_dir.cleanup()
+
+    def _build_index(self) -> None:
+        self.index.index_all()
+        asyncio.run(self.index.embed_pending())
+
+    def test_search_notes_returns_compact_ranked_list(self) -> None:
+        self._build_index()
+        text = asyncio.run(mcp_server.search_notes(mcp_server.SearchInput(query="记忆 怎么分层", limit=2)))
+        self.assertIn("语义 + 关键词", text)
+        first = text.split("\n")[2]
+        self.assertTrue(first.startswith("1. `mem01`"), first)
+        self.assertIn("▸ 记忆分层", text)
+        self.assertIn("collect_sections", text)
+        self.assertNotIn("长期记忆放数据库，短期记忆放上下文，记忆分层很重要。\n\n", text)  # no full bodies
+
+    def test_precise_search_requires_every_term(self) -> None:
+        self._build_index()
+        miss = asyncio.run(
+            mcp_server.search_notes_precise(mcp_server.PreciseSearchInput(query="止损 咖啡"))
+        )
+        self.assertIn("未找到同时包含", miss)
+        hit = asyncio.run(
+            mcp_server.search_notes_precise(mcp_server.PreciseSearchInput(query="止损 仓位"))
+        )
+        self.assertIn("`trd01`", hit)
+        self.assertNotIn("`cof01`", hit)
+
+    def test_collect_sections_groups_bodies_by_note(self) -> None:
+        self._build_index()
+        text = asyncio.run(
+            mcp_server.collect_sections(mcp_server.CollectSectionsInput(query="止损 仓位", max_chars=2000))
+        )
+        self.assertIn("### `trd01` 止损的数学真相", text)
+        self.assertIn("#### 仓位公式", text)
+        self.assertIn("止损决定单笔风险，仓位公式以止损为分母。", text)
+        self.assertIn("get_note_by_code", text)
+
+    def test_search_falls_back_to_legacy_matching_when_index_is_empty(self) -> None:
+        text = asyncio.run(mcp_server.search_notes(mcp_server.SearchInput(query="咖啡")))
+        self.assertIn("章节索引未建立", text)
+        self.assertIn("`cof01`", text)
+        collect = asyncio.run(
+            mcp_server.collect_sections(mcp_server.CollectSectionsInput(query="咖啡"))
+        )
+        self.assertIn("章节索引未建立", collect)
+
+    def test_stats_reports_index_state(self) -> None:
+        self._build_index()
+        text = asyncio.run(mcp_server.knowledge_stats())
+        self.assertIn("**总笔记数**: 3", text)
+        self.assertIn("章节索引", text)
+        self.assertIn("待向量化 0", text)
 
 
 if __name__ == "__main__":

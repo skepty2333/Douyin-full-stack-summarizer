@@ -116,8 +116,11 @@ flowchart TD
 | `app/services/video_frames.py` | 视觉截图候选校验、本地 FFmpeg 三帧提取、清晰度择优、安全 JPEG 处理、PDF 内嵌和内容寻址知识资产持久化。 |
 | `app/services/wechat_api.py` | 企业微信 Access Token、文本、Markdown 与文件消息发送。 |
 | `app/utils/wechat_crypto.py` | 企业微信回调签名与 AES 加解密。 |
-| `app/database/knowledge_store.py` | SQLite 表、FTS5 索引、`knowledge_assets` 图片清单、内容哈希校验、读写、查重和搜索。 |
-| `mcp_server.py` | Streamable HTTP / stdio MCP 服务与 9 个文字/图片知识库工具。 |
+| `app/database/knowledge_store.py` | SQLite 表、FTS5 索引、`knowledge_assets` 图片清单、内容哈希校验、读写、查重和旧版搜索。 |
+| `app/services/note_chunker.py` | 按标题把笔记 Markdown 切成章节块，生成展示文本与向量化文本。 |
+| `app/database/note_index.py` | `note_chunks` / `chunk_embeddings` 派生表、向量补算、语义 + 关键词混合检索与段落汇集。 |
+| `scripts/build_note_index.py` | 建立或刷新章节索引的幂等脚本。 |
+| `mcp_server.py` | Streamable HTTP / stdio MCP 服务与 10 个文字/图片知识库工具。 |
 
 视频页面由 `httpx` 直接请求并读取 `_ROUTER_DATA`，项目当前不依赖 `yt-dlp` 完成解析。
 
@@ -433,31 +436,50 @@ curl -fsS http://127.0.0.1:8080/ready
 
 SQLite 的 `knowledge_assets` 表是图片资产清单，以 `knowledge_id + asset_key` 唯一定位笔记内图片，保存 `mime_type`、`relative_path`、`sha256`、字节数、宽高、视频时间点、caption、视觉类型、置信度、质量分和展示顺序。JPEG 本体位于 `KNOWLEDGE_ASSETS_DIR/blobs/<sha256 前两位>/<sha256>.jpg`；相同内容自然复用同一路径，而逻辑 URI 在文件去重或部署迁移后保持稳定。图片列表接口从不返回服务器路径。
 
-SQLite 使用 WAL 提高读写并存能力。FTS5 表通过触发器与主表同步，搜索按以下顺序执行：
+SQLite 使用 WAL 提高读写并存能力。旧的 FTS5 表仍由触发器同步，但只作为章节索引尚未建立时的兜底。
 
-1. 标签 `LIKE` 匹配。
-2. FTS5 全文检索标题、作者和正文。
-3. 普通 SQL `LIKE` 兜底。
+### 7.1 章节级混合检索
 
-`search_precise` 对拆分后的关键词应用 AND 逻辑，适合缩小检索范围。标准 Markdown 的时间与 caption 保留在正文 alt 文本中，因此纯文本搜索和不支持图片的客户端仍能理解该视觉证据的基本含义；需要查看原图时再通过 MCP 按需读取。
+检索单位是笔记的章节而不是整篇笔记。`app/services/note_chunker.py` 按 H1/H2/H3 标题把 Markdown 切成章节块（围栏代码内的 `#` 不算标题，超过 1,200 字的章节按段落再切，零散碎片并入前一块），每块保留原始 Markdown 供展示，另生成去掉格式和图片 URI 的 `embed_text` 用于哈希与向量化。当前库 253 条笔记约 3,000 块，中位数 214 字。
+
+`app/database/note_index.py` 在同一 SQLite 中维护两张派生表：
+
+| 表 | 内容 |
+| :--- | :--- |
+| `note_chunks` | `knowledge_id`、`chunk_index`、`heading_path`、正文、`embed_text` 及其 SHA-256；随笔记删除级联删除 |
+| `chunk_embeddings` | 以 `embed_text` 哈希 + 模型 + 维度为主键的 L2 归一化 float32 向量；文本不变则不重算 |
+
+向量由同一 Workspace 的 `text-embedding-v4`（1024 维，OpenAI 兼容 `embeddings` 接口，单次最多 10 条）生成，调用与其他模型一样进入 `model_usage_log`。检索时全部向量载入内存做余弦，几千块规模下毫秒级完成；缓存以表行数为代际号，写入后自动失效。
+
+查询走两路召回再用 RRF（k=60）融合：
+
+1. 语义通道：查询向量与全部章节向量的余弦，取前 200；
+2. 关键词通道：查询按空格/逗号拆词，在章节正文、标题路径、笔记标题和标签中做大小写不敏感的原文匹配（正文 1 分、标题和标签各 0.5 分），保证产品名、工具名这类向量模糊的词精确命中。
+
+笔记排序由其最佳章节决定，命中章节数只做并列时的次序；RRF 分数在名次之间几乎平坦，任何求和式聚合都会让"多段弱命中"压过"单段强命中"。`search_precise` 要求所有关键词都出现在同一条笔记中（标题、标签或任一章节），再按同样的规则排序。语义通道不可用（未配置 Key、接口失败）时自动退化为纯关键词检索并在结果中标明。
+
+`collect_sections` 按融合顺序挑选章节正文直到字数预算：每条笔记最多贡献若干段，与已选段落余弦 ≥ 0.92 的近重复段落被跳过，输出按笔记分组并标注视频码与章节路径。这是"把所有讲 X 的段落一次读完"的入口：20 条相关笔记的全文约 6.8 万字，而它们的相关章节通常 1 万字左右。
+
+索引是派生数据。首次部署或升级后运行 `venv/bin/python scripts/build_note_index.py` 建立（`--rebuild` 重切所有笔记、`--no-embed` 只切分、`--stats` 查看状态）；此后 Bot 在每条笔记入库后于后台切分并向量化，启动时补齐遗漏。标准 Markdown 的时间与 caption 保留在正文 alt 文本中，因此纯文本搜索和不支持图片的客户端仍能理解该视觉证据的基本含义；需要查看原图时再通过 MCP 按需读取。
 
 ---
 
 ## 8. MCP Server
 
-MCP 服务提供 9 个工具：
+MCP 服务提供 10 个工具：
 
 | 工具 | 参数 | 作用 |
 | :--- | :--- | :--- |
-| `search_notes` | `query`, `limit` | 标签、标题和正文的宽松搜索。 |
-| `search_notes_precise` | `query`, `limit` | 所有关键词都必须命中的精确搜索。 |
+| `search_notes` | `query`, `limit`（默认 10，最多 30） | 章节级混合检索；每条笔记只出现一次，返回视频码、入库日期、命中章节数、相似度、最佳章节标题与片段。 |
+| `search_notes_precise` | `query`, `limit` | 所有关键词都必须命中同一条笔记的精确搜索，命中后按相关性排序。 |
+| `collect_sections` | `query`, `max_chars`（默认 12,000）, `max_per_note`（默认 3） | 汇集最相关的章节正文，跨笔记去重，按笔记分组返回。 |
 | `get_note` | `note_id` | 按数据库 ID 获取完整 Markdown 与元数据；存在图片时提示可按需读取。 |
 | `get_note_by_code` | `video_code` | 按 5 位视频码获取完整 Markdown；保留正文中的逻辑图片 URI。 |
 | `list_note_images` | `note_id` | 按展示顺序列出图片 ID、时间、caption 和 `knowledge-asset://` 引用，不暴露文件路径。 |
 | `get_note_image` | `video_code`, `asset_id` | 解析逻辑引用，校验清单、大小、JPEG 格式和 SHA-256 后返回 MCP `Image`。 |
 | `list_notes` | `limit`, `offset` | 分页列出最近笔记。 |
 | `list_by_tag` | `tag`, `limit` | 按标签筛选笔记。 |
-| `knowledge_stats` | 无 | 查看总笔记数、最新记录与数据库路径。 |
+| `knowledge_stats` | 无 | 查看总笔记数、最新记录、数据库路径与章节索引状态。 |
 
 默认配置为：
 
@@ -466,7 +488,7 @@ MCP_HOST=127.0.0.1
 MCP_PORT=8090
 ```
 
-默认 loopback 监听并保留 FastMCP 的 DNS rebinding 防护。多模态客户端先读取笔记文字，只有需要核对某张视觉证据时才调用 `list_note_images` / `get_note_image`，避免在每次检索中传输全部 JPEG。远程客户端应通过带身份认证的 HTTPS 反向代理、VPN 或受控隧道访问，不应把 MCP 端口直接绑定到公网地址。
+推荐的消费顺序是 `search_notes` 找候选、`collect_sections` 一次读完相关段落、`get_note_by_code` 读整篇；意图路由由 MCP 客户端选择工具完成，服务端不做查询分类。默认 loopback 监听并保留 FastMCP 的 DNS rebinding 防护。多模态客户端先读取笔记文字，只有需要核对某张视觉证据时才调用 `list_note_images` / `get_note_image`，避免在每次检索中传输全部 JPEG。远程客户端应通过带身份认证的 HTTPS 反向代理、VPN 或受控隧道访问，不应把 MCP 端口直接绑定到公网地址。
 
 ---
 

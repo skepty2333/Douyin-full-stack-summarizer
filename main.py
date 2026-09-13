@@ -28,7 +28,7 @@ from app.config import (
     CORP_ID, CALLBACK_TOKEN, CALLBACK_AES_KEY,
     TEMP_DIR, LOG_LEVEL, SERVER_HOST, SERVER_PORT,
     KNOWLEDGE_ASSETS_DIR, MAX_CONCURRENT_JOBS, JOB_TIMEOUT_SECONDS, DOWNLOAD_TIMEOUT_SECONDS,
-    MODEL_USAGE_LOG_ENABLED,
+    MODEL_USAGE_LOG_ENABLED, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS,
     validate_ai_config,
 )
 from app.utils.wechat_crypto import WXBizMsgCrypt
@@ -44,7 +44,7 @@ from app.services.douyin_parser import (
     resolve_and_download, cleanup_files, cleanup_stale_job_dirs,
 )
 from app.services.ai_summarizer import summarize_with_artifacts, generate_tags_with_ai
-from app.services.aliyun_client import close_aliyun_client
+from app.services.aliyun_client import aliyun_client, close_aliyun_client
 from app.services.pdf_generator import generate_pdf
 from app.services.video_frames import (
     persist_video_frame_markers_for_storage,
@@ -52,6 +52,7 @@ from app.services.video_frames import (
     strip_video_frame_markers_for_storage,
 )
 from app.database.knowledge_store import KnowledgeAsset, KnowledgeStore, KnowledgeEntry
+from app.database.note_index import NoteIndex
 from app.database.model_usage_store import (
     bind_model_usage_context,
     get_model_usage_store,
@@ -72,6 +73,41 @@ logger = logging.getLogger("douyin-bot")
 
 crypto = WXBizMsgCrypt(CALLBACK_TOKEN, CALLBACK_AES_KEY, CORP_ID)
 knowledge_db = KnowledgeStore()
+
+
+async def _embed_for_index(texts):
+    return await aliyun_client.embed(
+        model=EMBEDDING_MODEL,
+        texts=texts,
+        dimensions=EMBEDDING_DIMENSIONS,
+        operation="embedding_index",
+    )
+
+
+# 章节级检索索引：笔记入库后在后台切分并向量化，失败不影响交付。
+note_index = NoteIndex(embed_fn=_embed_for_index)
+
+
+async def _index_note_in_background(entry_id: int) -> None:
+    try:
+        report = await note_index.index_note_and_embed(entry_id)
+        logger.info(
+            "章节索引完成: note=%s chunks=%s pending=%s",
+            entry_id, report.chunks_written, report.embeddings_pending,
+        )
+    except Exception:
+        logger.exception("章节索引失败: note=%s（可用 scripts/build_note_index.py 补齐）", entry_id)
+
+
+async def _catch_up_note_index() -> None:
+    """Index notes saved while indexing was unavailable (crash, API outage)."""
+    try:
+        report = await asyncio.to_thread(note_index.index_all, only_missing=True)
+        embedded = await note_index.embed_pending()
+        if report.notes_indexed or embedded:
+            logger.info("章节索引补齐: notes=%s embedded=%s", report.notes_indexed, embedded)
+    except Exception:
+        logger.exception("章节索引补齐失败（可用 scripts/build_note_index.py 重试）")
 
 # 消息去重
 _processed_msgs: Dict[str, float] = {}
@@ -198,6 +234,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("模型调用日志数据库初始化失败")
     _accepting_messages = True
+    _spawn_background(_catch_up_note_index())
     logger.info("Bot 启动")
     yield
     _accepting_messages = False
@@ -641,12 +678,13 @@ async def _execute_summary_task(
                     duration_seconds=summary_result.diagnostics.duration_seconds or 0.0,
                     video_code=video_code,
                 )
-                await asyncio.to_thread(
+                entry_id = await asyncio.to_thread(
                     knowledge_db.save,
                     entry,
                     allow_overwrite,
                     knowledge_assets,
                 )
+                _spawn_background(_index_note_in_background(entry_id))
 
                 pdf_path = os.path.join(os.path.dirname(task.parsed_video_path), "summary.pdf")
                 pdf_delivered = False

@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
@@ -440,6 +440,82 @@ class AliyunModelClient:
             response_payload=data,
         )
         return content
+
+    @staticmethod
+    def _extract_embeddings(data: dict[str, Any], expected: int) -> list[list[float]]:
+        items = data.get("data")
+        if not isinstance(items, list) or len(items) != expected:
+            raise AliyunAPIError("百炼 embeddings 返回条数与请求不符")
+        vectors: list[Optional[list[float]]] = [None] * expected
+        for item in items:
+            if not isinstance(item, dict):
+                raise AliyunAPIError("百炼 embeddings 返回格式异常")
+            index = item.get("index")
+            vector = item.get("embedding")
+            if (
+                not isinstance(index, int)
+                or not (0 <= index < expected)
+                or vectors[index] is not None
+                or not isinstance(vector, list)
+                or not vector
+                or not all(isinstance(value, (int, float)) for value in vector)
+            ):
+                raise AliyunAPIError("百炼 embeddings 返回向量无效")
+            vectors[index] = [float(value) for value in vector]
+        return [vector for vector in vectors if vector is not None]
+
+    async def embed(
+        self,
+        *,
+        model: str,
+        texts: Sequence[str],
+        dimensions: Optional[int] = None,
+        operation: str = "embedding",
+    ) -> list[list[float]]:
+        """Embed a small batch of texts through the OpenAI-compatible endpoint."""
+        inputs = [str(text) for text in texts]
+        if not inputs:
+            return []
+        if any(not text.strip() for text in inputs):
+            raise ValueError("embedding 输入不能为空文本")
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": inputs,
+            "encoding_format": "float",
+        }
+        if dimensions is not None:
+            payload["dimensions"] = dimensions
+        started_at = datetime.now(timezone.utc).isoformat()
+        started_monotonic = time.monotonic()
+        metrics = _RequestMetrics()
+        data: Optional[dict[str, Any]] = None
+        try:
+            data = await self._post("embeddings", payload, metrics=metrics)
+            vectors = self._extract_embeddings(data, expected=len(inputs))
+        except BaseException as exc:
+            await self._record_model_call(
+                model=model,
+                operation=operation,
+                api_kind="embeddings",
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                metrics=metrics,
+                response_payload=data,
+                error=exc,
+            )
+            raise
+        await self._record_model_call(
+            model=model,
+            operation=operation,
+            api_kind="embeddings",
+            status="success",
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            metrics=metrics,
+            response_payload=data,
+        )
+        return vectors
 
     async def responses(
         self,

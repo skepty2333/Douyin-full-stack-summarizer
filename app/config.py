@@ -79,6 +79,12 @@ ALIYUN_RESEARCH_MODEL = os.getenv("ALIYUN_RESEARCH_MODEL", "qwen3.7-plus")
 ALIYUN_FINAL_MODEL = os.getenv("ALIYUN_FINAL_MODEL", "qwen3.8-max")
 ALIYUN_TAG_MODEL = os.getenv("ALIYUN_TAG_MODEL", "qwen3.7-flash")
 
+# 知识库章节向量索引：同一 Workspace 的 OpenAI 兼容 embeddings 接口。
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v4")
+EMBEDDING_DIMENSIONS = _env_int("EMBEDDING_DIMENSIONS", 1024, 64)
+# 兼容接口单次最多接受的文本条数；超过会被服务端拒绝。
+EMBEDDING_BATCH_SIZE = _env_int("EMBEDDING_BATCH_SIZE", 10)
+
 AI_REQUEST_TIMEOUT_SECONDS = _env_float("AI_REQUEST_TIMEOUT_SECONDS", 240.0, 1.0)
 AI_MAX_RETRIES = _env_int("AI_MAX_RETRIES", 3, 0)
 AI_MAX_CONCURRENCY = _env_int("AI_MAX_CONCURRENCY", 3)
