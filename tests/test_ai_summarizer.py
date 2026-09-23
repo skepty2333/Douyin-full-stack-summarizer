@@ -923,3 +923,128 @@ class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AlbumSourceKindTests(unittest.IsolatedAsyncioTestCase):
+    """图文 posts reuse research and final editing with a labelled primary source."""
+
+    ALBUM_TRANSCRIPT = "【帖子文案】\n量化策略思路分享\n\n【图片 1】\n第一张卡片的文字。"
+
+    async def test_stage2_album_source_is_labelled_and_keyed_as_album_transcript(self) -> None:
+        with patch.object(
+            ai_summarizer.aliyun_client,
+            "chat",
+            new_callable=AsyncMock,
+            return_value="<internal_research_memo>离线研究</internal_research_memo>",
+        ) as chat:
+            await ai_summarizer.stage2_deep_research(
+                self.ALBUM_TRANSCRIPT,
+                ai_summarizer.STANDARD_POLICY,
+                video_title="量化策略思路分享",
+                video_author="新用户1401",
+                user_requirement="",
+                duration_seconds=None,
+                transcript_char_count=len(self.ALBUM_TRANSCRIPT),
+                source_kind="image_album",
+            )
+
+        payload = json.loads(chat.await_args.kwargs["messages"][1]["content"])
+        self.assertEqual(
+            set(payload),
+            {"research_policy", "video_metadata", "complete_album_transcript"},
+        )
+        self.assertEqual(payload["complete_album_transcript"], self.ALBUM_TRANSCRIPT)
+        self.assertEqual(payload["video_metadata"]["source_kind"], "image_album")
+        self.assertIsNone(payload["research_policy"]["duration_seconds"])
+
+    async def test_stage2_video_source_stays_speech_by_default(self) -> None:
+        with patch.object(
+            ai_summarizer.aliyun_client,
+            "chat",
+            new_callable=AsyncMock,
+            return_value="<internal_research_memo>离线研究</internal_research_memo>",
+        ) as chat:
+            await ai_summarizer.stage2_deep_research(
+                "语音逐字稿",
+                ai_summarizer.STANDARD_POLICY,
+                video_title="视频",
+                video_author="作者",
+                duration_seconds=120,
+                transcript_char_count=5,
+            )
+
+        payload = json.loads(chat.await_args.kwargs["messages"][1]["content"])
+        self.assertEqual(payload["complete_audio_transcript"], "语音逐字稿")
+        self.assertEqual(payload["video_metadata"]["source_kind"], "speech")
+
+    async def test_stage3_album_source_keys_primary_material_as_album(self) -> None:
+        with patch.object(
+            ai_summarizer.aliyun_client,
+            "chat",
+            new_callable=AsyncMock,
+            return_value="最终笔记",
+        ) as chat:
+            result = await ai_summarizer.stage3_enrich_and_finalize(
+                "增强版逐图转写",
+                "<internal_research_memo>无</internal_research_memo>",
+                video_author="新用户1401",
+                user_requirement="",
+                policy=ai_summarizer.STANDARD_POLICY,
+                source_transcript=self.ALBUM_TRANSCRIPT,
+                visual_evidence="- [V0002｜图片 2｜visible_fact｜high] 流程图",
+                video_title="量化策略思路分享",
+                duration_seconds=None,
+                source_kind="image_album",
+            )
+
+        self.assertEqual(result, "最终笔记")
+        payload = json.loads(chat.await_args.kwargs["messages"][1]["content"])
+        self.assertEqual(payload["primary_album_transcript_verbatim"], self.ALBUM_TRANSCRIPT)
+        self.assertNotIn("primary_audio_transcript_verbatim", payload)
+        self.assertEqual(payload["primary_enhanced_transcript"], "增强版逐图转写")
+        self.assertEqual(payload["video_metadata"]["source_kind"], "image_album")
+        self.assertIsNone(payload["video_metadata"]["duration_seconds"])
+
+    async def test_stage3_request_timeout_is_forwarded_to_the_client(self) -> None:
+        with patch.object(
+            ai_summarizer.aliyun_client,
+            "chat",
+            new_callable=AsyncMock,
+            return_value="最终笔记",
+        ) as chat:
+            await ai_summarizer.stage3_enrich_and_finalize(
+                "增强", "备忘", policy=ai_summarizer.STANDARD_POLICY, source_transcript="原文"
+            )
+            await ai_summarizer.stage3_enrich_and_finalize(
+                "增强",
+                "备忘",
+                policy=ai_summarizer.STANDARD_POLICY,
+                source_transcript="原文",
+                request_timeout=900.0,
+            )
+
+        default_kwargs, long_kwargs = (call.kwargs for call in chat.await_args_list)
+        self.assertIsNone(default_kwargs["timeout"])
+        self.assertEqual(long_kwargs["timeout"], 900.0)
+
+    async def test_stage3_video_source_keeps_audio_key_and_speech_label(self) -> None:
+        with patch.object(
+            ai_summarizer.aliyun_client,
+            "chat",
+            new_callable=AsyncMock,
+            return_value="最终笔记",
+        ) as chat:
+            await ai_summarizer.stage3_enrich_and_finalize(
+                "增强逐字稿",
+                "<internal_research_memo>无</internal_research_memo>",
+                video_author="作者",
+                policy=ai_summarizer.STANDARD_POLICY,
+                source_transcript="原始逐字稿",
+                video_title="视频",
+                duration_seconds=90,
+            )
+
+        payload = json.loads(chat.await_args.kwargs["messages"][1]["content"])
+        self.assertEqual(payload["primary_audio_transcript_verbatim"], "原始逐字稿")
+        self.assertNotIn("primary_album_transcript_verbatim", payload)
+        self.assertEqual(payload["video_metadata"]["source_kind"], "speech")

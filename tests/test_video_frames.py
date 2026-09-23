@@ -404,3 +404,115 @@ class MarkerRenderingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AlbumPictureFrameTests(unittest.TestCase):
+    """Album pictures are original evidence: keep the whole card, just resize."""
+
+    def _tall_card(self, path: Path, fmt: str = "WEBP") -> None:
+        image = Image.new("RGB", (1440, 2036), (250, 250, 250))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((100, 100, 1340, 300), fill=(20, 20, 20))      # headline at the top
+        draw.rectangle((100, 1800, 1340, 1950), fill=(200, 30, 30))   # footnote at the bottom
+        image.save(path, format=fmt)
+
+    def test_tall_album_picture_is_resized_whole_not_cropped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            directory = Path(temp_name).resolve()
+            source = directory / "images" / "image_03.webp"
+            source.parent.mkdir()
+            self._tall_card(source)
+
+            frame = video_frames.sanitize_album_picture(
+                source, directory / "video_frames", annotation_id="V0003", label="图片 3"
+            )
+
+            self.assertEqual(frame.path, directory / "video_frames" / "video_frame_V0003.jpg")
+            self.assertEqual(frame.annotation_id, "V0003")
+            self.assertEqual(frame.source_label, "图片 3")
+            self.assertEqual(frame.timestamp_ms, 0)
+            self.assertEqual(os.stat(frame.path).st_mode & 0o777, 0o600)
+            with Image.open(frame.path) as image:
+                self.assertEqual(image.format, "JPEG")
+                self.assertEqual(image.height, 1600)
+                self.assertAlmostEqual(image.width / image.height, 1440 / 2036, delta=0.002)
+                top = ImageStat.Stat(image.crop((100, 90, 1000, 220))).mean[0]
+                bottom = ImageStat.Stat(image.crop((100, 1420, 1000, 1530))).mean[0]
+            self.assertLess(top, 60)        # headline survived
+            self.assertLess(bottom, 235)    # footnote survived: nothing was cropped away
+            self.assertLessEqual(frame.path.stat().st_size, video_frames.MAX_FRAME_BYTES)
+            self.assertTrue(video_frames._read_verified_frame(frame).startswith(b"\xff\xd8"))
+
+    def test_exif_orientation_is_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            directory = Path(temp_name).resolve()
+            source = directory / "image_01.jpg"
+            image = Image.new("RGB", (200, 100), (90, 90, 90))
+            exif = Image.Exif()
+            exif[0x0112] = 6  # rotate 90° clockwise on display
+            image.save(source, format="JPEG", exif=exif.tobytes())
+
+            frame = video_frames.sanitize_album_picture(
+                source, directory, annotation_id="V0001", label="图片 1"
+            )
+
+            with Image.open(frame.path) as result:
+                self.assertEqual(result.size, (100, 200))
+
+    def test_undecodable_album_picture_is_rejected_and_leaves_no_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            directory = Path(temp_name).resolve()
+            source = directory / "image_01.jpg"
+            source.write_bytes(b"definitely not an image")
+
+            with self.assertRaises(ValueError):
+                video_frames.sanitize_album_picture(
+                    source, directory, annotation_id="V0001", label="图片 1"
+                )
+
+            self.assertFalse((directory / "video_frame_V0001.jpg").exists())
+
+    def test_invalid_annotation_id_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            directory = Path(temp_name).resolve()
+            source = directory / "image_01.jpg"
+            _save_test_jpeg(source)
+
+            with self.assertRaises(ValueError):
+                video_frames.sanitize_album_picture(
+                    source, directory, annotation_id="../V0001", label="图片 1"
+                )
+
+    def test_label_replaces_timestamp_in_pdf_and_storage_captions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name).resolve()
+            job_dir = root / "job"
+            job_dir.mkdir()
+            path = job_dir / "video_frame_V0002.jpg"
+            _save_test_jpeg(path)
+            frame = video_frames.ExtractedVideoFrame(
+                annotation_id="V0002",
+                timestamp_ms=0,
+                path=path,
+                kind="ocr",
+                confidence="high",
+                caption="策略流程图",
+                quality_score=1.0,
+                source_label="图片 2",
+            )
+
+            pdf_html = video_frames.render_video_frame_markers_for_pdf(
+                "正文\n\n[[VIDEO_FRAME:V0002]]", {"V0002": frame}
+            )
+            markdown, assets = video_frames.persist_video_frame_markers_for_storage(
+                "正文\n\n[[VIDEO_FRAME:V0002]]",
+                {"V0002": frame},
+                video_code="A0002",
+                asset_root=root / "assets",
+            )
+
+        self.assertIn("图片 2 · 策略流程图", pdf_html)
+        self.assertNotIn("视频画面", pdf_html)
+        self.assertIn("![图片 2：策略流程图](knowledge-asset://A0002/V0002)", markdown)
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(assets[0].caption, "策略流程图")

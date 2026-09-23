@@ -146,11 +146,16 @@ class AliyunModelClient:
         authorize: bool = True,
         retry: bool = True,
         metrics: Optional[_RequestMetrics] = None,
+        timeout: Optional[float] = None,
     ) -> dict[str, Any]:
         self._check_configuration()
         headers = dict(extra_headers or {})
         if authorize:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        # A per-call override lengthens read/write only: connecting stays fast.
+        request_timeout = (
+            httpx.Timeout(timeout, connect=min(timeout, 20.0)) if timeout is not None else None
+        )
 
         attempt_limit = self.max_retries if retry else 0
         async with self._semaphore:
@@ -161,6 +166,8 @@ class AliyunModelClient:
                     request_kwargs: dict[str, Any] = {"headers": headers}
                     if payload is not None:
                         request_kwargs["json"] = payload
+                    if request_timeout is not None:
+                        request_kwargs["timeout"] = request_timeout
                     response = await self._client.request(method, url, **request_kwargs)
                 except (httpx.TimeoutException, httpx.NetworkError) as exc:
                     if attempt >= attempt_limit:
@@ -212,8 +219,11 @@ class AliyunModelClient:
         payload: dict[str, Any],
         *,
         metrics: Optional[_RequestMetrics] = None,
+        timeout: Optional[float] = None,
     ) -> dict[str, Any]:
-        return await self._request_json("POST", path, payload=payload, metrics=metrics)
+        return await self._request_json(
+            "POST", path, payload=payload, metrics=metrics, timeout=timeout
+        )
 
     async def _record_model_call(
         self,
@@ -389,7 +399,10 @@ class AliyunModelClient:
         preserve_thinking: Optional[bool] = None,
         response_format: Optional[dict[str, Any]] = None,
         operation: str = "chat",
+        timeout: Optional[float] = None,
     ) -> str:
+        """``timeout`` (seconds) overrides the client read/write timeout for one
+        long non-streaming generation; ``None`` keeps the configured default."""
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -414,7 +427,9 @@ class AliyunModelClient:
         metrics = _RequestMetrics()
         data: Optional[dict[str, Any]] = None
         try:
-            data = await self._post("chat/completions", payload, metrics=metrics)
+            data = await self._post(
+                "chat/completions", payload, metrics=metrics, timeout=timeout
+            )
             content = self._extract_content(data)
         except BaseException as exc:
             await self._record_model_call(

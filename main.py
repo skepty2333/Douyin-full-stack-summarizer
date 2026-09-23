@@ -44,6 +44,7 @@ from app.services.douyin_parser import (
     resolve_and_download, cleanup_files, cleanup_stale_job_dirs,
 )
 from app.services.ai_summarizer import summarize_with_artifacts, generate_tags_with_ai
+from app.services.album_summarizer import summarize_album_with_artifacts
 from app.services.aliyun_client import aliyun_client, close_aliyun_client
 from app.services.pdf_generator import generate_pdf
 from app.services.video_frames import (
@@ -190,6 +191,11 @@ class PendingTask:
     parsed_video_path: str = ""
     parsed_media_url: str = ""
     parsed_published_at: str = ""
+    # 图文作品：media_kind="images"，图片按帖内顺序存放；视频作品这些字段为空。
+    parsed_media_kind: str = "video"
+    parsed_image_paths: List[str] = field(default_factory=list)
+    parsed_caption: str = ""
+    parsed_work_dir: str = ""
 
 
 @dataclass
@@ -587,6 +593,10 @@ async def _process_task_init(
         task.parsed_video_path = video_info["video_path"]
         task.parsed_media_url = video_info.get("video_url", "")
         task.parsed_published_at = video_info.get("published_at", "") or ""
+        task.parsed_media_kind = video_info.get("media_kind", "video") or "video"
+        task.parsed_image_paths = list(video_info.get("image_paths") or [])
+        task.parsed_caption = video_info.get("caption", "") or ""
+        task.parsed_work_dir = video_info.get("work_dir", "") or ""
 
         # 查重 (Title + Author)
         duplicates = await asyncio.to_thread(
@@ -652,10 +662,11 @@ async def _execute_summary_task(
                     if task.extra_requirement.strip().lower() not in ("开始", "start", "ok", "好"):
                         req = task.extra_requirement
 
+                is_album = task.parsed_media_kind == "images"
                 video_code = video_code_override or await asyncio.to_thread(generate_video_code)
                 await _safe_send_text(
                     user_id,
-                    f"视频: {task.parsed_title}\n作者: {task.parsed_author}\n"
+                    f"{'图文' if is_album else '视频'}: {task.parsed_title}\n作者: {task.parsed_author}\n"
                     f"视频码: {video_code}\n\n处理中...",
                 )
 
@@ -666,14 +677,25 @@ async def _execute_summary_task(
                     job_id=task.job_id,
                     video_code=video_code,
                 ):
-                    summary_result = await summarize_with_artifacts(
-                        task.parsed_video_path,
-                        task.parsed_title,
-                        task.parsed_author,
-                        req,
-                        progress_callback=progress,
-                        media_url=task.parsed_media_url,
-                    )
+                    if is_album:
+                        summary_result = await summarize_album_with_artifacts(
+                            task.parsed_image_paths,
+                            task.parsed_title,
+                            task.parsed_author,
+                            req,
+                            progress_callback=progress,
+                            caption=task.parsed_caption,
+                            work_dir=task.parsed_work_dir,
+                        )
+                    else:
+                        summary_result = await summarize_with_artifacts(
+                            task.parsed_video_path,
+                            task.parsed_title,
+                            task.parsed_author,
+                            req,
+                            progress_callback=progress,
+                            media_url=task.parsed_media_url,
+                        )
                     summary = strip_video_frame_markers_for_storage(
                         summary_result.markdown
                     )
@@ -752,7 +774,8 @@ async def _execute_summary_task(
                         logger.exception("词表关联失败: note=%s（可用 scripts/retag_notes.py 补）", entry_id)
                 _spawn_background(_index_note_in_background(entry_id))
 
-                pdf_path = os.path.join(os.path.dirname(task.parsed_video_path), "summary.pdf")
+                pdf_dir = task.parsed_work_dir or os.path.dirname(task.parsed_video_path)
+                pdf_path = os.path.join(pdf_dir, "summary.pdf")
                 pdf_delivered = False
                 try:
                     pdf_markdown = render_video_frame_markers_for_pdf(

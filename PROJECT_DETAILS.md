@@ -115,11 +115,12 @@ flowchart TD
 | :--- | :--- |
 | `main.py` | FastAPI 生命周期、企业微信回调、每用户队列、任务状态机、全局并发、超时和健康检查。 |
 | `app/config.py` | 环境变量加载、数值约束、模型映射与本地 AI 配置检查。 |
-| `app/services/douyin_parser.py` | 链接提取、页面解析、视频流式下载、任务目录隔离、FFmpeg 音频提取和过期目录清理。 |
+| `app/services/douyin_parser.py` | 链接提取、页面解析、视频流式下载、图文作品原图下载、任务目录隔离、FFmpeg 音频提取和过期目录清理。 |
 | `app/services/aliyun_client.py` | 统一百炼客户端、原生异步 FileTrans、兼容接口连接池、AI 并发、超时、退避重试和响应解析。 |
 | `app/services/ai_summarizer.py` | 带时间戳文件转写、本地切片回退、并行视觉/研究、确定性增强逐字稿、截图审核、终稿与标签生成。 |
+| `app/services/album_summarizer.py` | 图文作品：原图规范化为候选帧、一次多图逐图转写与校验、按字数选档、候选图上限、复用研究与终稿阶段。 |
 | `app/services/pdf_generator.py` | Markdown、HTML、CSS、审核 JPEG 与 Matplotlib 路径化公式 SVG 的 PDF 交付渲染。 |
-| `app/services/video_frames.py` | 视觉截图候选校验、本地 FFmpeg 三帧提取、清晰度择优、安全 JPEG 处理、PDF 内嵌和内容寻址知识资产持久化。 |
+| `app/services/video_frames.py` | 视觉截图候选校验、本地 FFmpeg 三帧提取、清晰度择优、安全 JPEG 处理、图文原图整张规范化、PDF 内嵌和内容寻址知识资产持久化。 |
 | `app/services/wechat_api.py` | 企业微信 Access Token、文本、Markdown 与文件消息发送。 |
 | `app/utils/wechat_crypto.py` | 企业微信回调签名与 AES 加解密。 |
 | `app/database/knowledge_store.py` | SQLite 表、FTS5 索引、`knowledge_assets` 图片清单、内容哈希校验、读写、查重和旧版搜索。 |
@@ -281,7 +282,15 @@ Stage2 在全部时长档都关闭思考，并按时长限制输出 Token 与备
 
 `qwen3.7-flash` 随后对笔记做一次分类与标签调用（`app/services/note_tagging.py`），输出 JSON：`domain`（ai / trading / life / other）、`temporality`（stable / version_sensitive / time_bound）和 3–6 个标签。提示词里注入当前受控词表（规范名、类型、别名），要求优先使用规范名，只有词表确实没有合适条目时才新建，并给新名标注 `kind`（topic / entity / content_type）。返回的标签经别名表归一后写入 `note_tags`，`knowledge.tags` 只保留规范名的逗号列表供展示与旧版匹配。分类调用失败时退回旧的自由标签提示词，笔记照常入库，只是缺少 `domain` / `temporality` 与词表关联，之后可用 `scripts/retag_notes.py` 补齐。
 
-### 4.6 PDF 交付与矢量公式
+### 4.6 图文作品（图片轮播）
+
+抖音图文作品在详情接口中表现为 `aweme_type=68`、`media_type=2`、`images` 非空；其 `video.play_addr` 指向的是配乐音频（`audio/mp4`），不是视频。解析器以 `images` 是否存在判定作品类型，按帖内顺序取每张图 `url_list` 中的 JPEG 变体（无水印；`download_url_list` 为水印版，不使用），跳过自带 `video` 的动图子项，最多 35 张，下载到任务目录 `images/`。单张下载失败或无法解码只跳过该图，全部失败才报错。`resolve_and_download` 通过 `media_kind`（`video` / `images`）、`image_paths` 与 `caption`（完整文案）向任务状态机描述结果。
+
+图文没有语音，因此不运行 ASR，也没有时长。`album_summarizer` 先把每张原图规范化为 `video_frames/video_frame_V000N.jpg`（EXIF 转正、最长边 1600 像素、≤ 2 MB，整张保留、不做视频帧的竖屏裁剪），编号与帖内顺序一致；然后按 `ALBUM_READ_BATCH_SIZE`（4 张）分批、并发调用视觉模型（`ALIYUN_VISUAL_MODEL`，`operation=album_reading`，JSON 输出，关闭思考；并发受百炼客户端信号量约束），让模型逐图给出完整文字转写、文字之外的画面信息、`kind` / `confidence`、是否值得给终稿编辑看原图以及敏感信息标记。分批是必要的：17 张数学卡片的整篇转写在一次非流式调用中会超过 240 秒的 `AI_REQUEST_TIMEOUT_SECONDS`；任一批失败即整篇失败，不生成残缺笔记。逐图转写与图文终稿调用都把 `AI_LONG_REQUEST_TIMEOUT_SECONDS` 作为单次请求读超时传给百炼客户端（`chat(timeout=...)` 只放宽读写超时，连接超时不变）。校验规则与视频视觉增量一致：ID 必须对应真实图片、每张图恰好一条、字段有界、`screenshot_recommended` 依赖 `editor_frame_recommended`、敏感图片不进候选。每批请求内的 JPEG 总量有 24 MB 预算，超出时在内存中缩小后重发，仍超出则任务失败。
+
+帖子文案加逐图转写（`【图片 N】` 分块）构成一手材料：Stage2 以 `complete_album_transcript` 接收，Stage3 以 `primary_album_transcript_verbatim` 接收，`video_metadata.source_kind=image_album`，两段系统提示各有一段说明图文输入的处理规则。生成档位不由时长决定，而按转写字数选择：≤ 600 字 compact、≤ 2,000 standard、≤ 4,500 extended、更多 long。候选图不经过截图独立审核（原图不存在“截得准不准”的问题），由逐图转写直接给出图注；优先保留带展示建议的图片，其余按阅读顺序补足，最多 8 张交给 Stage3。终稿、持久化与 PDF 复用视频链路，仅图注前缀由“视频画面 mm:ss”改为“图片 N”；知识库 `duration_seconds` 记为 0。
+
+### 4.7 PDF 交付与矢量公式
 
 PDF 是知识笔记的一种交付视图，规范 Markdown、`knowledge_assets` 清单和内容寻址 JPEG 才是可继续检索与多模态读取的持久层。生成 PDF 时，审核截图会从当前任务产物安全内嵌，不允许渲染器访问任意外部 URL 或本地路径。
 
@@ -292,7 +301,7 @@ LaTeX 公式采用 Matplotlib 的 MathText 本地渲染：
 - Matplotlib 的共享字体和公式缓存由进程内互斥锁保护；并发 PDF 任务串行进入公式测量与 SVG 序列化临界区，避免缓存争用和不稳定输出。
 - SVG 以受大小限制的 `data:image/svg+xml;base64,...` 内嵌；单个公式渲染失败时保留代码样式兜底，不让整份 PDF 失败。
 
-### 4.7 Workspace 接入地址
+### 4.8 Workspace 接入地址
 
 配置中保留同一 Workspace 的两个根地址：
 
@@ -311,7 +320,7 @@ ALIYUN_FINAL_MODEL=qwen3.8-max
 - Key、compatible 地址和 native 地址必须来自同一地域、同一 Workspace。
 - 文档和配置模板只能保留占位符，真实 Key 不应提交到 Git 或打印到日志。
 
-### 4.8 模型调用观测与价格快照
+### 4.9 模型调用观测与价格快照
 
 观测功能默认关闭；设置 `MODEL_USAGE_LOG_ENABLED=true` 并重启 Bot 后启用。`AliyunModelClient` 在逻辑调用边界统一采集使用量，不由各提示词阶段自行拼日志。Chat Completions、Responses、FileTrans 和本地 ASR 即使失败或取消也各写一条 `model_usage_log`；HTTP 重试累计到该条记录的 `request_count` 与 `retry_count`，不会被当成多次业务调用。FileTrans 的提交、轮询和结果下载仍属于同一个逻辑调用。
 
@@ -380,6 +389,7 @@ $TEMP_DIR/jobs/<job_id>/
 - 视频流式写入 `.part` 文件，成功后通过原子替换发布为 `video.mp4`。
 - 网络协议错误、连接错误、超时和 HTTP 状态错误默认最多尝试 3 次，并进行指数等待。
 - 下载内容类型和最小文件大小会被校验，视频文件有 500 MB 安全上限。
+- 图文原图逐张下载，校验 `image/*` 内容类型、20 MB 上限和 Pillow 可解码；单张失败跳过，不中断整帖。
 - 主路径把抖音公网直链交给原生 FileTrans；只有主路径失败才进行本地音频提取和分段。
 - 回退路径的音频提取和分段均有独立 FFmpeg 超时，阻塞命令在线程中执行，不阻塞 FastAPI 事件循环。
 - 可选截图始终从任务目录的本地视频提取；三候选择优、JPEG 重新编码和独立审核任何一步失败都返回空截图，不中断文字终稿。
@@ -558,6 +568,7 @@ chmod 600 .env
 | 变量 | 默认值 | 调整原则 |
 | :--- | :---: | :--- |
 | `AI_REQUEST_TIMEOUT_SECONDS` | 240 | 仅在长输出稳定触发超时时增加。 |
+| `AI_LONG_REQUEST_TIMEOUT_SECONDS` | 900 | 图文逐图转写与图文终稿的单次读超时；实测 17 张数学卡片（3.1 万字转写）的带图终稿在 240 秒内无法完成。 |
 | `AI_MAX_RETRIES` | 3 | 限流频繁时优先降低并发，不宜无限增加重试。 |
 | `AI_MAX_CONCURRENCY` | 3 | 不应高于 Workspace 配额可承受范围。 |
 | `ASR_FILE_POLL_INTERVAL_SECONDS` | 2 | FileTrans 状态轮询间隔；不宜设置过低。 |
@@ -583,6 +594,7 @@ chmod 600 .env
 - SQLite 适合单机部署；多实例横向扩展需要外部队列和共享数据库。
 - `/ready` 不验证百炼余额、模型权限或真实网络连通性，完整验证需要受控的端到端测试。
 - FileTrans 主路径可回退到本地切片 ASR；两条 ASR 路径都失败时任务无法生成笔记。
+- 图文作品没有语音回退：逐图转写调用失败即任务失败。图文帖中的动图子项、配乐里的原声解说暂不处理；知识库没有作品类型列，图文笔记以 `duration_seconds=0` 区分。
 - 联网研究、视觉增量、截图、分类标签、章节索引和主题生长均可独立降级；可靠转写与终稿仍是生成笔记的必要阶段。分类失败的笔记只缺领域 / 时效与词表关联，索引和主题失败可用脚本补齐。
 - 多模态知识由 SQLite 清单和 `KNOWLEDGE_ASSETS_DIR` 两部分组成；只备份数据库或只复制 blob 目录都不是完整备份。章节与向量可重建，词表、标签关联和主题页版本不能。
 - 主题页是模型从章节编译的派生层：结论带视频码可回溯，但编译质量、拆分归属和分类判断都可能出错；笔记本身不会被修改，页面可否决、可重编译、可回看旧版本。词表条目的合并与改名会改变标签归属，不可自动撤销。

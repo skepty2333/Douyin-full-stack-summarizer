@@ -108,6 +108,9 @@ class ExtractedVideoFrame:
     confidence: str
     caption: str
     quality_score: float
+    # Album pictures have no timeline; a label such as "图片 3" replaces the
+    # "视频画面 mm:ss" prefix in captions.
+    source_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -240,6 +243,48 @@ def extract_video_frames(
     return deduplicated
 
 
+def sanitize_album_picture(
+    source: Union[str, os.PathLike[str]],
+    output_dir: Union[str, os.PathLike[str]],
+    *,
+    annotation_id: str,
+    label: str,
+) -> ExtractedVideoFrame:
+    """Turn one downloaded 图文 picture into a verified evidence frame.
+
+    Unlike video screenshots, the whole picture is the evidence: it is only
+    re-encoded, orientation-corrected and bounded in size, never cropped.  The
+    fixed ``video_frame_<id>.jpg`` name keeps every downstream check intact.
+    """
+
+    if not isinstance(annotation_id, str) or not FRAME_ID_RE.fullmatch(annotation_id):
+        raise ValueError("图片 ID 无效")
+    source_path = Path(source)
+    if not source_path.is_absolute() or ".." in source_path.parts or source_path.is_symlink():
+        raise ValueError("图片路径无效")
+    destination_dir = Path(output_dir)
+    if not destination_dir.is_absolute() or ".." in destination_dir.parts:
+        raise ValueError("截图目录必须是无跳转段的绝对路径")
+    destination_dir.mkdir(mode=0o700, parents=False, exist_ok=True)
+    destination = destination_dir / f"video_frame_{annotation_id}.jpg"
+    try:
+        _write_sanitized_jpeg(source_path, destination, crop_portrait=False)
+    except Exception as exc:  # decode errors, decompression bombs, I/O failures
+        destination.unlink(missing_ok=True)
+        raise ValueError(f"图片无法处理: {exc}") from exc
+    clean_label = str(label or "").strip()[:40]
+    return ExtractedVideoFrame(
+        annotation_id=annotation_id,
+        timestamp_ms=0,
+        path=destination,
+        kind="visible_fact",
+        confidence="high",
+        caption=clean_label,
+        quality_score=0.0,
+        source_label=clean_label,
+    )
+
+
 def render_video_frame_markers_for_pdf(
     markdown_text: str,
     frames: Union[Mapping[str, ExtractedVideoFrame], Sequence[ExtractedVideoFrame]],
@@ -280,15 +325,15 @@ def render_video_frame_markers_for_pdf(
         embedded_bytes += len(image_bytes)
         encoded = base64.b64encode(image_bytes).decode("ascii")
         caption = html.escape(frame.caption.strip()[:MAX_ANNOTATION_TEXT_CHARS])
-        timestamp = _format_timestamp(frame.timestamp_ms)
-        alt = html.escape(f"视频截图 {timestamp}：{frame.caption.strip()[:240]}", quote=True)
+        label = html.escape(_frame_label(frame))
+        alt = html.escape(f"{_frame_label(frame)}：{frame.caption.strip()[:240]}", quote=True)
         return (
             "\n\n<figure class=\"video-evidence-frame\" "
             "style=\"margin:12px auto 16px;text-align:center;page-break-inside:avoid;\">"
             f"<img src=\"data:image/jpeg;base64,{encoded}\" alt=\"{alt}\" "
             "style=\"display:block;max-width:100%;height:auto;margin:0 auto;\"/>"
             f"<figcaption style=\"margin-top:5px;color:#666;font-size:0.86em;\">"
-            f"视频画面 {timestamp} · {caption}</figcaption></figure>\n\n"
+            f"{label} · {caption}</figcaption></figure>\n\n"
         )
 
     rendered = FRAME_MARKER_RE.sub(replace_marker, markdown_text)
@@ -372,9 +417,9 @@ def persist_video_frame_markers_for_storage(
             return ""
 
         caption = _escape_markdown_alt(record.caption)
-        timestamp = _format_timestamp(record.timestamp_ms)
+        label = _escape_markdown_alt(_frame_label(frame))
         return (
-            f"\n\n![视频画面 {timestamp}：{caption}]"
+            f"\n\n![{label}：{caption}]"
             f"(knowledge-asset://{video_code}/{annotation_id})\n\n"
         )
 
@@ -855,7 +900,12 @@ def _score_candidate(path: Path) -> float:
         return math.log1p(max(0.0, edge_variance)) + 1.5 * exposure_score + 0.4 * contrast_score
 
 
-def _write_sanitized_jpeg(source: Path, destination: Path) -> None:
+def _write_sanitized_jpeg(
+    source: Path,
+    destination: Path,
+    *,
+    crop_portrait: bool = True,
+) -> None:
     if not FRAME_ID_RE.fullmatch(destination.stem.removeprefix("video_frame_")):
         raise ValueError("截图文件名无效")
     if destination.name != f"video_frame_{destination.stem.removeprefix('video_frame_')}.jpg":
@@ -866,7 +916,8 @@ def _write_sanitized_jpeg(source: Path, destination: Path) -> None:
             raise ValueError("截图尺寸无效")
         image.load()
         clean = ImageOps.exif_transpose(image).convert("RGB")
-        clean = _crop_portrait_evidence(clean)
+        if crop_portrait:
+            clean = _crop_portrait_evidence(clean)
         clean.thumbnail((MAX_FRAME_DIMENSION, MAX_FRAME_DIMENSION), _resampling_lanczos())
 
         descriptor, temporary_name = tempfile.mkstemp(
@@ -1081,6 +1132,13 @@ def _deduplicate_similar_frames(
         frame.annotation_id: frame
         for frame in sorted(kept, key=lambda value: (value.timestamp_ms, value.annotation_id))
     }
+
+
+def _frame_label(frame: ExtractedVideoFrame) -> str:
+    label = str(frame.source_label or "").strip()
+    if label:
+        return label[:40]
+    return f"视频画面 {_format_timestamp(frame.timestamp_ms)}"
 
 
 def _format_timestamp(timestamp_ms: int) -> str:

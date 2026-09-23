@@ -80,6 +80,10 @@ Stage2 在所有档位关闭思考。Stage3 的思考预算和输出护栏只由
 
 篇幅是软护栏，不是凑字目标。终稿以视频语音和画面为主体，研究内容只用于解决理解障碍、重大事实问题和适用边界；正常流程不会向企业微信发送四个 AI 阶段的进度消息，仅在 FileTrans 失败并切换本地识别等降级场景发送必要提示。
 
+### 图文作品（图片轮播）
+
+分享链接指向图文作品时（详情接口 `aweme_type=68`、`images` 非空），解析器按帖内顺序下载全部无水印原图（最多 35 张），不再把 `play_addr` 里的配乐音频当视频下载。图文没有语音，所以不跑 ASR：Stage1 改为多图阅读调用（`qwen3.8-max`，`operation=album_reading`，每 4 张一批并发提交，避免单次非流式调用超出 `AI_REQUEST_TIMEOUT_SECONDS`），逐图输出完整文字转写、文字之外的画面信息和是否值得给终稿编辑看原图；帖子文案加逐图转写作为一手材料交给 Stage2 与 Stage3（输入带 `source_kind=image_album`），档位按转写字数选择（≤600 字 compact、≤2,000 standard、≤4,500 extended、更多 long）。图文的逐图转写与终稿调用使用 `AI_LONG_REQUEST_TIMEOUT_SECONDS`（默认 900 秒）：一篇 3 万字的图文终稿在 240 秒内写不完。原图本身就是候选帧：整张保留、不做竖屏裁剪，最多 8 张交给 Stage3；纯文字卡片转写为正文，只有图表、示意图、界面、实物这类文字装不下的才插图，PDF 与知识库中的图注写作“图片 N”。图文帖里的动图子项与配乐里的人声暂不处理。
+
 ### 模型用量与费用观测
 
 该功能默认关闭。需要开始观测时，在 `.env` 设置 `MODEL_USAGE_LOG_ENABLED=true` 并重启 Bot；之后每次逻辑模型调用会写入 SQLite 的 `model_usage_log`。记录包括任务 ID、视频码、模型、处理环节、成功/失败/取消、起止时间、耗时、请求与重试次数、服务端 request ID、输入/输出/缓存/推理 Token、音频时长和价格快照下的估算费用。视觉分析、截图审核、联网研究、终稿和标签会分别标识；一次 HTTP 重试不会被误记成多次业务调用。
@@ -165,7 +169,7 @@ DASHSCOPE_NATIVE_BASE_URL=https://YOUR_WORKSPACE_ID.cn-beijing.maas.aliyuncs.com
 | 企业微信 | `CORP_ID`、`AGENT_ID`、`CORP_SECRET`、`CALLBACK_TOKEN`、`CALLBACK_AES_KEY` |
 | 百炼 | `DASHSCOPE_API_KEY`、`DASHSCOPE_BASE_URL`、`DASHSCOPE_NATIVE_BASE_URL` |
 | 模型 | `ALIYUN_ASR_MODEL`、`ALIYUN_ASR_FALLBACK_MODEL`、`ALIYUN_VISUAL_MODEL`、`ALIYUN_RESEARCH_MODEL`、`ALIYUN_FINAL_MODEL`、`ALIYUN_TAG_MODEL` |
-| AI 容量 | `AI_REQUEST_TIMEOUT_SECONDS`、`AI_MAX_RETRIES`、`AI_MAX_CONCURRENCY` |
+| AI 容量 | `AI_REQUEST_TIMEOUT_SECONDS`、`AI_LONG_REQUEST_TIMEOUT_SECONDS`、`AI_MAX_RETRIES`、`AI_MAX_CONCURRENCY` |
 | 任务容量 | `MAX_CONCURRENT_JOBS`、`JOB_TIMEOUT_SECONDS`、`DOWNLOAD_TIMEOUT_SECONDS` |
 | ASR 回退 | `ASR_SEGMENT_SECONDS`、`ASR_MAX_FILE_MB`、`ASR_FILE_POLL_INTERVAL_SECONDS`、`ASR_FILE_TIMEOUT_SECONDS` |
 | 用量观测 | `MODEL_USAGE_LOG_ENABLED`、`MODEL_USAGE_DB_PATH` |
@@ -282,11 +286,12 @@ venv/bin/python scripts/grow_topics.py --dry-run       # 预览会出生的主�
 │   └── services/
 │       ├── aliyun_client.py        # 百炼原生/兼容接口、embeddings、超时、并发与重试
 │       ├── ai_summarizer.py        # ASR、并行视觉/研究、终稿
+│       ├── album_summarizer.py     # 图文作品：逐图转写、档位、候选图与三阶段编排
 │       ├── note_tagging.py         # 领域 / 时效分类与词表标签
 │       ├── note_chunker.py         # Markdown 章节切分
 │       ├── topic_compiler.py       # 主题页编译、引用校验、超限拆分
-│       ├── douyin_parser.py        # 抖音解析、发布时间、隔离下载与音频提取
-│       ├── video_frames.py         # 抽帧、审核输入、去重和知识图片持久化
+│       ├── douyin_parser.py        # 抖音解析、发布时间、视频/图文隔离下载与音频提取
+│       ├── video_frames.py         # 抽帧、图文原图规范化、审核输入、去重和知识图片持久化
 │       ├── pdf_generator.py        # Markdown、矢量公式与 PDF
 │       └── wechat_api.py           # 企业微信 Token、消息和文件上传
 ├── deployment/                     # systemd 与 Nginx 模板
@@ -314,7 +319,7 @@ systemd-analyze verify deployment/douyin-bot.service deployment/douyin-mcp.servi
 venv/bin/python scripts/model_usage_report.py --days 7
 ```
 
-测试覆盖动态时长档、FileTrans 与本地回退、Stage1/Stage2 并行、逐字稿完整性、截图独立审核、调用日志隐私边界、Token/缓存/音频计费、路径与大小限制、内容寻址图片、章节切分与混合检索（含降级、别名扩展、领域过滤、近重复抑制）、词表归一与合并、分类解析、主题出生 / 编译 / 拆分 / 否决、MCP 全部工具、公式 PDF、企业微信分段发送和队列状态转换。付费模型权限、抖音页面可用性、企业微信回调与主题页的实际编译质量仍需通过受控的端到端任务验证。
+测试覆盖动态时长档、FileTrans 与本地回退、Stage1/Stage2 并行、逐字稿完整性、截图独立审核、图文作品的图片选取 / 下载 / 逐图转写校验 / 候选图上限 / 请求预算与任务分发、调用日志隐私边界、Token/缓存/音频计费、路径与大小限制、内容寻址图片、章节切分与混合检索（含降级、别名扩展、领域过滤、近重复抑制）、词表归一与合并、分类解析、主题出生 / 编译 / 拆分 / 否决、MCP 全部工具、公式 PDF、企业微信分段发送和队列状态转换。付费模型权限、抖音页面可用性、企业微信回调与主题页的实际编译质量仍需通过受控的端到端任务验证。
 
 ## 已知边界
 
@@ -323,6 +328,7 @@ venv/bin/python scripts/model_usage_report.py --days 7
 - 抖音页面结构、反爬策略和数据中心 IP 限制可能导致解析失败。
 - `/ready` 不验证百炼余额、实际模型权限或外部网络连通性。
 - FileTrans 与本地 ASR 都失败时无法生成笔记；视觉、研究、截图、分类标签、章节索引和主题生长都可以独立降级，缺失部分可用脚本补齐。
+- 图文作品的逐图转写调用失败时无法生成笔记（没有语音可回退）；图文帖里的动图子项和配乐中的原声解说不参与处理。
 - 主题页是模型从笔记章节编译的派生层：结论都带视频码可回溯，但编译质量仍可能出错；笔记本身不会被修改，页面可否决、可重编译、可回看旧版本。
 - MCP 不承担公网认证与 TLS；主题相关工具会写入知识库，端点必须留在受控边界内。
 

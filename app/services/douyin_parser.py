@@ -41,14 +41,16 @@ DOUYIN_DOWNLOAD_HEADERS = {
 TTWID_REGISTER_URL = "https://ttwid.bytedance.com/ttwid/union/register/"
 DOUYIN_DETAIL_URL = "https://www.douyin.com/aweme/v1/web/aweme/detail/"
 DETAIL_AID_CANDIDATES = ("6383", "1128")
+# 图文作品（图片轮播）：抖音客户端单帖最多 35 张。
+MAX_ALBUM_IMAGES = 35
 
 
 def extract_url_from_text(text: str) -> Optional[str]:
     """提取抖音分享链接"""
     patterns = [
         r'https?://v\.douyin\.com/[A-Za-z0-9_-]+/?',
-        r'https?://www\.douyin\.com/video/\d+',
-        r'https?://www\.iesdouyin\.com/share/video/\d+',
+        r'https?://www\.douyin\.com/(?:video|note)/\d+',
+        r'https?://www\.iesdouyin\.com/share/(?:video|note)/\d+',
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -177,6 +179,48 @@ def _select_video_url(item: dict[str, Any]) -> str:
             if urlparse(candidate).scheme in {"http", "https"}:
                 return candidate
     return ""
+
+
+def _is_image_album(item: dict[str, Any]) -> bool:
+    """A 图文 post carries an ``images`` list; its ``video`` is only the BGM."""
+    images = item.get("images")
+    return isinstance(images, list) and any(isinstance(image, dict) for image in images)
+
+
+def _select_image_urls(item: dict[str, Any]) -> list[str]:
+    """Pick one unwatermarked URL per album image, preserving reading order.
+
+    ``url_list`` offers the same picture as WebP and JPEG; ``download_url_list``
+    is the watermarked variant and is never used.  Entries that carry their own
+    ``video`` are animated clips, which this pipeline does not handle.
+    """
+    if not _is_image_album(item):
+        return []
+    selected: list[str] = []
+    for image in item.get("images") or []:
+        if not isinstance(image, dict) or isinstance(image.get("video"), dict):
+            continue
+        candidates = [
+            _normalize_video_url(candidate)
+            for candidate in (image.get("url_list") or [])
+            if isinstance(candidate, str)
+        ]
+        candidates = [
+            candidate
+            for candidate in candidates
+            if urlparse(candidate).scheme == "https"
+        ]
+        if not candidates:
+            continue
+        jpeg = [
+            candidate
+            for candidate in candidates
+            if urlparse(candidate).path.lower().endswith((".jpeg", ".jpg"))
+        ]
+        selected.append(jpeg[0] if jpeg else candidates[0])
+        if len(selected) >= MAX_ALBUM_IMAGES:
+            break
+    return selected
 
 
 def _detail_query(video_id: str, aid: str) -> str:
@@ -350,13 +394,20 @@ def _job_directory(job_id: str) -> Path:
 
 
 async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> dict:
-    """解析链接并下载视频"""
+    """解析链接并下载媒体：视频作品下载 MP4，图文作品下载全部原图。
+
+    返回的 ``media_kind`` 为 ``"video"`` 或 ``"images"``；图文作品的
+    ``video_path``/``video_url`` 为空，图片按帖内顺序列在 ``image_paths``。
+    """
     os.makedirs(TEMP_DIR, exist_ok=True)
     job_id = job_id or uuid.uuid4().hex
     work_dir = _job_directory(job_id)
     logger.info("解析抖音分享链接: host=%s", urlparse(share_url).hostname or "unknown")
 
     video_url, title, author, video_id, published_at = None, "未知标题", "未知作者", "", ""
+    caption = ""
+    media_kind = "video"
+    image_urls: list[str] = []
 
     async with httpx.AsyncClient(headers=MOBILE_HEADERS, follow_redirects=True, timeout=30) as client:
         try:
@@ -376,9 +427,15 @@ async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> 
 
             if item:
                 title = item.get("desc") or title
+                caption = str(item.get("desc") or "")
                 author = (item.get("author") or {}).get("nickname") or author
                 published_at = _publish_time(item)
-                video_url = _select_video_url(item)
+                if _is_image_album(item):
+                    # 图文作品的 play_addr 只是配乐音频，不能当视频下载。
+                    media_kind = "images"
+                    image_urls = _select_image_urls(item)
+                else:
+                    video_url = _select_video_url(item)
             else:
                 logger.warning("抖音作品详情中未找到有效视频信息")
                 
@@ -386,17 +443,105 @@ async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> 
             logger.error("抖音页面解析失败: %s", type(exc).__name__)
             raise RuntimeError(f"抖音页面解析失败（{type(exc).__name__}）") from exc
 
+    common = {
+        "video_id": video_id, "title": title, "author": author,
+        "published_at": published_at, "caption": caption,
+        "job_id": job_id, "work_dir": str(work_dir),
+    }
+
+    if media_kind == "images":
+        if not image_urls:
+            raise ValueError("无法获取图文作品的图片地址")
+        image_paths = await _download_album_images(image_urls, job_id=job_id)
+        if not image_paths:
+            raise ValueError("图文作品的图片全部下载失败")
+        return {
+            **common, "media_kind": "images",
+            "video_path": "", "video_url": "", "image_paths": image_paths,
+        }
+
     if not video_url: raise ValueError("无法获取视频地址")
 
     # 3. 下载视频
     video_path = await _download_video(video_url, video_id, job_id=job_id)
 
     return {
-        "video_id": video_id, "title": title, "author": author,
-        "published_at": published_at,
-        "video_path": video_path, "video_url": video_url, "job_id": job_id,
-        "work_dir": str(work_dir),
+        **common, "media_kind": "video",
+        "video_path": video_path, "video_url": video_url, "image_paths": [],
     }
+
+
+MAX_ALBUM_IMAGE_BYTES = 20 * 1024 * 1024
+_IMAGE_SUFFIXES = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif"}
+
+
+async def _download_album_images(
+    image_urls: list[str],
+    *,
+    job_id: str,
+    max_retries: int = 3,
+) -> list[str]:
+    """Download album pictures in order; unreadable ones are skipped, not fatal."""
+    from PIL import Image, UnidentifiedImageError
+
+    work_dir = _job_directory(job_id)
+    image_dir = work_dir / "images"
+    image_dir.mkdir(mode=0o700, exist_ok=True)
+    saved: list[str] = []
+
+    async with httpx.AsyncClient(headers=DOUYIN_DOWNLOAD_HEADERS, follow_redirects=True, timeout=60) as client:
+        for index, image_url in enumerate(image_urls, start=1):
+            partial_path = image_dir / f"image_{index:02d}.part"
+            for attempt in range(1, max_retries + 1):
+                try:
+                    async with client.stream("GET", image_url) as resp:
+                        resp.raise_for_status()
+                        content_type = resp.headers.get("content-type", "").lower()
+                        if content_type and not (
+                            content_type.startswith("image/") or "octet-stream" in content_type
+                        ):
+                            raise ValueError(f"图片内容类型异常: {content_type}")
+                        downloaded = 0
+                        with open(partial_path, "wb") as f:
+                            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                                downloaded += len(chunk)
+                                if downloaded > MAX_ALBUM_IMAGE_BYTES:
+                                    raise ValueError("图片超过 20MB 安全上限")
+                                f.write(chunk)
+                    with Image.open(partial_path) as image:
+                        image_format = image.format or ""
+                        image.verify()
+                    suffix = _IMAGE_SUFFIXES.get(image_format)
+                    if suffix is None:
+                        raise ValueError(f"不支持的图片格式: {image_format or 'unknown'}")
+                    final_path = image_dir / f"image_{index:02d}{suffix}"
+                    os.replace(partial_path, final_path)
+                    saved.append(str(final_path))
+                    break
+                except asyncio.CancelledError:
+                    partial_path.unlink(missing_ok=True)
+                    raise
+                except (ValueError, OSError, UnidentifiedImageError) as exc:
+                    partial_path.unlink(missing_ok=True)
+                    logger.warning("图文图片 %s 无效，已跳过: %s", index, exc)
+                    break
+                except (
+                    httpx.RemoteProtocolError,
+                    httpx.ReadError,
+                    httpx.ConnectError,
+                    httpx.TimeoutException,
+                    httpx.HTTPStatusError,
+                ) as exc:
+                    partial_path.unlink(missing_ok=True)
+                    logger.warning(
+                        "图文图片 %s 下载失败 (attempt %s/%s): %s",
+                        index, attempt, max_retries, type(exc).__name__,
+                    )
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 ** attempt)
+
+    logger.info("图文图片下载完成: ok=%s total=%s", len(saved), len(image_urls))
+    return saved
 
 
 async def _download_video(

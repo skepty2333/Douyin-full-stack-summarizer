@@ -137,6 +137,24 @@ class AliyunModelClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "bounded output")
 
+    async def test_chat_timeout_override_reaches_the_transport(self) -> None:
+        seen: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(dict(request.extensions["timeout"]))
+            return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+        client = self.make_client(httpx.MockTransport(handler))
+        await client.chat(model="qwen3.8-max", messages=[{"role": "user", "content": "a"}])
+        await client.chat(
+            model="qwen3.8-max", messages=[{"role": "user", "content": "b"}], timeout=900.0
+        )
+
+        self.assertEqual(seen[0]["read"], 1.0)      # client default from make_client
+        self.assertEqual(seen[1]["read"], 900.0)
+        self.assertEqual(seen[1]["write"], 900.0)
+        self.assertEqual(seen[1]["connect"], 20.0)  # long generations do not loosen connect
+
     async def test_chat_can_omit_output_limit_for_prompt_controlled_long_form(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             payload = json.loads(request.content)
