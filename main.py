@@ -591,7 +591,7 @@ async def _process_task_init(
         task.parsed_title = video_info["title"] or "未知标题"
         task.parsed_author = video_info["author"] or "未知作者"
         task.parsed_video_path = video_info["video_path"]
-        task.parsed_media_url = video_info.get("video_url", "")
+        task.parsed_media_url = video_info.get("media_url", "")
         task.parsed_published_at = video_info.get("published_at", "") or ""
         task.parsed_media_kind = video_info.get("media_kind", "video") or "video"
         task.parsed_image_paths = list(video_info.get("image_paths") or [])

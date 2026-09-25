@@ -129,6 +129,12 @@ def _normalize_video_url(url: str) -> str:
 
 def _select_video_url(item: dict[str, Any]) -> str:
     """Select an H.264 MP4 URL, preferring a direct CDN over redirect APIs."""
+    candidates = _video_url_candidates(item)
+    return candidates[0] if candidates else ""
+
+
+def _video_url_candidates(item: dict[str, Any]) -> list[str]:
+    """All H.264 MP4 URLs in preference order: direct CDNs before redirect APIs."""
     video = item.get("video") or {}
     addresses: list[dict[str, Any]] = []
 
@@ -160,7 +166,7 @@ def _select_video_url(item: dict[str, Any]) -> str:
     if isinstance(download_address, dict):
         addresses.append(download_address)
 
-    seen: set[str] = set()
+    selected: list[str] = []
     for address in addresses:
         candidates = [
             _normalize_video_url(candidate)
@@ -173,11 +179,35 @@ def _select_video_url(item: dict[str, Any]) -> str:
             }
         )
         for candidate in candidates:
-            if candidate in seen:
+            if candidate in selected:
                 continue
-            seen.add(candidate)
             if urlparse(candidate).scheme in {"http", "https"}:
-                return candidate
+                selected.append(candidate)
+    return selected
+
+
+async def _public_media_url(candidates: list[str]) -> str:
+    """Return a video URL that Bailian can fetch without Douyin's Referer.
+
+    Bailian downloads ``media_url`` from its own servers with no Referer, and
+    some CDN hosts (``*.douyinvod.com``) answer that with 403
+    (FILE_403_FORBIDDEN).  The ``www.douyin.com`` play API redirects to a
+    public CDN, so its final URL is handed over instead.  Empty when no
+    candidate works; the pipeline then uses local ASR and skips vision.
+    """
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        for candidate in candidates:
+            try:
+                async with client.stream(
+                    "GET", candidate, headers={"Range": "bytes=0-0"}
+                ) as resp:
+                    content_type = resp.headers.get("content-type", "").lower()
+                    if resp.status_code in (200, 206) and any(
+                        t in content_type for t in ("video", "octet-stream")
+                    ):
+                        return str(resp.url)
+            except httpx.HTTPError:
+                continue
     return ""
 
 
@@ -408,6 +438,7 @@ async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> 
     caption = ""
     media_kind = "video"
     image_urls: list[str] = []
+    video_candidates: list[str] = []
 
     async with httpx.AsyncClient(headers=MOBILE_HEADERS, follow_redirects=True, timeout=30) as client:
         try:
@@ -435,7 +466,8 @@ async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> 
                     media_kind = "images"
                     image_urls = _select_image_urls(item)
                 else:
-                    video_url = _select_video_url(item)
+                    video_candidates = _video_url_candidates(item)
+                    video_url = video_candidates[0] if video_candidates else None
             else:
                 logger.warning("抖音作品详情中未找到有效视频信息")
                 
@@ -465,9 +497,20 @@ async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> 
     # 3. 下载视频
     video_path = await _download_video(video_url, video_id, job_id=job_id)
 
+    # 4. 百炼从自己的服务器拉取媒体、不带 Referer，需要单独选一个公网可访问的地址。
+    media_url = await _public_media_url(video_candidates)
+    if not media_url:
+        logger.warning("没有无需 Referer 的视频地址，本次使用本地音频识别并跳过画面理解")
+    elif media_url != video_url:
+        logger.info(
+            "下载地址需要 Referer，交给百炼的地址改为: host=%s",
+            urlparse(media_url).hostname or "unknown",
+        )
+
     return {
         **common, "media_kind": "video",
-        "video_path": video_path, "video_url": video_url, "image_paths": [],
+        "video_path": video_path, "video_url": video_url, "media_url": media_url,
+        "image_paths": [],
     }
 
 

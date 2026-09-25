@@ -444,3 +444,77 @@ class DouyinAlbumDownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["image_paths"], [])
             self.assertEqual(result["caption"], "普通视频")
             self.assertTrue(result["video_path"].endswith("video.mp4"))
+
+
+class DouyinPublicMediaUrlTests(unittest.IsolatedAsyncioTestCase):
+    """Bailian fetches media_url without Douyin's Referer (FILE_403_FORBIDDEN)."""
+
+    VIDEO_ID = "7677941996337833381"
+    GATED_URL = "https://v3-web.douyinvod.com/sig/video/tos/cn/abc/?a=6383"
+    PLAY_API_URL = "https://www.douyin.com/aweme/v1/play/?video_id=abc&line=0"
+    PUBLIC_URL = "https://v3-dy-o.zjcdn.com/sig/video/tos/cn/abc/?a=6383"
+
+    def _transport(self, *, play_api_works: bool) -> httpx.MockTransport:
+        detail = {
+            "aweme_id": self.VIDEO_ID,
+            "desc": "DeepSeek harness 手机控制",
+            "author": {"nickname": "小7说AI"},
+            "video": {"play_addr": {"url_list": [self.PLAY_API_URL, self.GATED_URL]}},
+        }
+        video = httpx.Response(
+            200, content=b"\x00" * (120 * 1024), headers={"content-type": "video/mp4"}
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "v.douyin.com":
+                return httpx.Response(
+                    302,
+                    headers={"location": f"https://www.iesdouyin.com/share/video/{self.VIDEO_ID}/"},
+                )
+            if request.url.host == "www.iesdouyin.com":
+                return httpx.Response(200, text="<html>no router data</html>")
+            if request.url.host == "ttwid.bytedance.com":
+                return httpx.Response(
+                    200, json={"status_code": 0}, headers={"set-cookie": "ttwid=t; Path=/"}
+                )
+            if request.url.host == "www.douyin.com" and request.url.path == "/aweme/v1/play/":
+                if not play_api_works:
+                    return httpx.Response(403)
+                return httpx.Response(302, headers={"location": self.PUBLIC_URL})
+            if request.url.host == "www.douyin.com":
+                return httpx.Response(200, json={"status_code": 0, "aweme_detail": detail})
+            if request.url.host == "v3-web.douyinvod.com":
+                if "douyin.com" not in request.headers.get("referer", ""):
+                    return httpx.Response(403, headers={"content-type": "video/mp4"})
+                return video
+            if request.url.host == "v3-dy-o.zjcdn.com":
+                return video
+            return httpx.Response(404)
+
+        return httpx.MockTransport(handler)
+
+    async def _resolve(self, transport: httpx.MockTransport, temp_dir: str) -> dict:
+        import functools
+
+        client_factory = functools.partial(httpx.AsyncClient, transport=transport)
+        with patch.object(douyin_parser, "TEMP_DIR", temp_dir), patch.object(
+            douyin_parser.httpx, "AsyncClient", client_factory
+        ):
+            return await douyin_parser.resolve_and_download(
+                "https://v.douyin.com/iwlrcdZ4EuQ/", "job_gated_0001"
+            )
+
+    async def test_referer_gated_cdn_hands_bailian_the_redirect_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = await self._resolve(self._transport(play_api_works=True), temp_dir)
+
+            self.assertEqual(result["video_url"], self.GATED_URL)
+            self.assertTrue(Path(result["video_path"]).is_file())
+            self.assertEqual(result["media_url"], self.PUBLIC_URL)
+
+    async def test_no_public_candidate_leaves_media_url_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = await self._resolve(self._transport(play_api_works=False), temp_dir)
+
+            self.assertTrue(Path(result["video_path"]).is_file())
+            self.assertEqual(result["media_url"], "")
