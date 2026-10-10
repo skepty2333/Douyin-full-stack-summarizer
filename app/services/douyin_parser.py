@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlencode, urlparse
 from app.config import TEMP_DIR, TEMP_FILE_TTL_HOURS
-from app.services.douyin_abogus import ABogus, BrowserFingerprintGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -23,22 +22,24 @@ DESKTOP_USER_AGENT = (
     "Chrome/139.0.0.0 Safari/537.36"
 )
 
-# 短链与分享页继续使用移动端 UA；作品详情接口要求桌面端参数与 UA 一致。
+# 短链与分享页继续使用移动端 UA；作品详情接口使用桌面端 UA。
 MOBILE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/121.0.2277.107 Version/17.0 Mobile/15E148 Safari/604.1'
 }
-DOUYIN_WEB_HEADERS = {
+# 2026-10 起详情接口前面有 Argus 网关：来源为 www.douyin.com 的请求必须带浏览器
+# 生成的 uifid 和新版签名，否则 403 "Uifid Not Found"。来源为 open.douyin.com 的
+# 精简请求（只带 aweme_id 与 aid）不经过这道检查，不需要 Cookie 或 a_bogus。
+DOUYIN_DETAIL_HEADERS = {
     "User-Agent": DESKTOP_USER_AGENT,
-    "Referer": "https://www.douyin.com/?recommend=1",
-    "Accept": "*/*",
-    "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Origin": "https://open.douyin.com",
+    "Referer": "https://open.douyin.com/",
+    "Accept": "application/json, text/plain, */*",
 }
 DOUYIN_DOWNLOAD_HEADERS = {
     "User-Agent": DESKTOP_USER_AGENT,
     "Referer": "https://www.douyin.com/",
     "Accept": "*/*",
 }
-TTWID_REGISTER_URL = "https://ttwid.bytedance.com/ttwid/union/register/"
 DOUYIN_DETAIL_URL = "https://www.douyin.com/aweme/v1/web/aweme/detail/"
 DETAIL_AID_CANDIDATES = ("6383", "1128")
 # 图文作品（图片轮播）：抖音客户端单帖最多 35 张。
@@ -253,95 +254,18 @@ def _select_image_urls(item: dict[str, Any]) -> list[str]:
     return selected
 
 
-def _detail_query(video_id: str, aid: str) -> str:
-    params = {
-        "device_platform": "webapp",
-        "aid": aid,
-        "channel": "channel_pc_web",
-        "update_version_code": "170400",
-        "pc_client_type": "1",
-        "pc_libra_divert": "Windows",
-        "version_code": "290100",
-        "version_name": "29.1.0",
-        "cookie_enabled": "true",
-        "screen_width": "1536",
-        "screen_height": "864",
-        "browser_language": "zh-CN",
-        "browser_platform": "Win32",
-        "browser_name": "Chrome",
-        "browser_version": "139.0.0.0",
-        "browser_online": "true",
-        "engine_name": "Blink",
-        "engine_version": "139.0.0.0",
-        "os_name": "Windows",
-        "os_version": "10",
-        "cpu_core_num": "16",
-        "device_memory": "8",
-        "platform": "PC",
-        "downlink": "10",
-        "effective_type": "4g",
-        "round_trip_time": "200",
-        "support_h265": "1",
-        "support_dash": "0",
-        "uifid": "",
-        "aweme_id": video_id,
-    }
-    return urlencode(params)
-
-
-async def _register_ttwid(client: httpx.AsyncClient) -> str:
-    """Create the anonymous visitor cookie required by Douyin's web API."""
-    response = await client.post(
-        TTWID_REGISTER_URL,
-        headers=DOUYIN_WEB_HEADERS,
-        json={
-            "region": "cn",
-            "aid": 1768,
-            "needFid": False,
-            "service": "www.douyin.com",
-            "migrate_info": {"ticket": "", "source": "node"},
-            "cbUrlProtocol": "https",
-            "union": True,
-        },
-    )
-    response.raise_for_status()
-    ttwid = response.cookies.get("ttwid", "").strip()
-    if not ttwid:
-        raise ValueError("ttwid 注册响应缺少 Cookie")
-
-    # The registration endpoint owns a bytedance.com cookie.  Copy the same
-    # visitor value to Douyin so httpx sends it to the detail API.
-    client.cookies.set("ttwid", ttwid, domain="www.douyin.com", path="/")
-    return ttwid
-
-
 async def _fetch_aweme_detail(
     client: httpx.AsyncClient,
     video_id: str,
 ) -> Optional[dict[str, Any]]:
-    """Fetch the current signed web-detail payload with anonymous cookies."""
+    """Fetch the web-detail payload through the unsigned open.douyin.com route."""
     for attempt in range(1, 3):
-        try:
-            await _register_ttwid(client)
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning(
-                "ttwid 注册失败: attempt=%s/2 error=%s",
-                attempt,
-                type(exc).__name__,
-            )
-            continue
-
         for aid in DETAIL_AID_CANDIDATES:
-            query = _detail_query(video_id, aid)
-            signer = ABogus(
-                fp=BrowserFingerprintGenerator.generate_fingerprint("Chrome"),
-                user_agent=DESKTOP_USER_AGENT,
-            )
-            signed_query, _, signed_ua, _ = signer.generate_abogus(query)
             try:
                 response = await client.get(
-                    f"{DOUYIN_DETAIL_URL}?{signed_query}",
-                    headers={**DOUYIN_WEB_HEADERS, "User-Agent": signed_ua},
+                    DOUYIN_DETAIL_URL,
+                    params={"aweme_id": video_id, "aid": aid},
+                    headers=DOUYIN_DETAIL_HEADERS,
                 )
                 response.raise_for_status()
                 if not response.content:
@@ -352,6 +276,16 @@ async def _fetch_aweme_detail(
                     )
                     continue
                 payload = response.json()
+            except httpx.HTTPStatusError as exc:
+                # 网关拦截时正文会写明原因（如 "Uifid Not Found"），记下来便于排查。
+                logger.warning(
+                    "作品详情接口失败: aid=%s attempt=%s/2 status=%s body=%r",
+                    aid,
+                    attempt,
+                    exc.response.status_code,
+                    exc.response.text[:80],
+                )
+                continue
             except (httpx.HTTPError, json.JSONDecodeError) as exc:
                 logger.warning(
                     "作品详情接口失败: aid=%s attempt=%s/2 error=%s",
@@ -450,10 +384,10 @@ async def resolve_and_download(share_url: str, job_id: Optional[str] = None) -> 
             if not video_id:
                 raise ValueError("无法提取视频ID")
 
-            # 2. 优先兼容旧分享页；页面数据降级为空时切换到当前签名接口。
+            # 2. 优先兼容旧分享页；页面数据降级为空时切换到详情接口。
             item = _extract_router_item(resp.text)
             if item is None:
-                logger.info("分享页无作品数据，切换到签名详情接口")
+                logger.info("分享页无作品数据，切换到详情接口")
                 item = await _fetch_aweme_detail(client, video_id)
 
             if item:

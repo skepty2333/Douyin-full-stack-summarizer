@@ -108,49 +108,56 @@ class DouyinCurrentParserTests(unittest.TestCase):
         )
 
 
-class DouyinSignedDetailTests(unittest.IsolatedAsyncioTestCase):
-    async def test_signed_detail_uses_anonymous_ttwid(self) -> None:
-        video_id = "7672445901280955694"
-        calls: list[str] = []
+class DouyinDetailTests(unittest.IsolatedAsyncioTestCase):
+    VIDEO_ID = "7672445901280955694"
+
+    def _detail(self) -> dict:
+        return {
+            "aweme_id": self.VIDEO_ID,
+            "desc": "测试作品",
+            "author": {"nickname": "测试作者"},
+            "video": {"play_addr": {"url_list": ["https://cdn.example.com/video.mp4"]}},
+        }
+
+    async def test_detail_is_an_unsigned_open_douyin_request(self) -> None:
+        requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            calls.append(request.url.host)
-            if request.url.host == "ttwid.bytedance.com":
-                return httpx.Response(
-                    200,
-                    json={"status_code": 0},
-                    headers={"set-cookie": "ttwid=test-visitor; Path=/; HttpOnly"},
-                )
+            requests.append(request)
+            return httpx.Response(200, json={"status_code": 0, "aweme_detail": self._detail()})
 
-            self.assertEqual(request.url.host, "www.douyin.com")
-            query = parse_qs(request.url.query.decode("ascii"))
-            self.assertEqual(query["aweme_id"], [video_id])
-            self.assertIn("a_bogus", query)
-            self.assertIn("ttwid=test-visitor", request.headers.get("cookie", ""))
-            return httpx.Response(
-                200,
-                json={
-                    "status_code": 0,
-                    "aweme_detail": {
-                        "aweme_id": video_id,
-                        "desc": "测试作品",
-                        "author": {"nickname": "测试作者"},
-                        "video": {
-                            "play_addr": {
-                                "url_list": ["https://cdn.example.com/video.mp4"]
-                            }
-                        },
-                    },
-                },
-            )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            detail = await douyin_parser._fetch_aweme_detail(client, self.VIDEO_ID)
 
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport) as client:
-            detail = await douyin_parser._fetch_aweme_detail(client, video_id)
-
-        self.assertIsNotNone(detail)
         self.assertEqual(detail["desc"], "测试作品")
-        self.assertEqual(calls, ["ttwid.bytedance.com", "www.douyin.com"])
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        self.assertEqual(request.url.host, "www.douyin.com")
+        self.assertEqual(
+            parse_qs(request.url.query.decode("ascii")),
+            {"aweme_id": [self.VIDEO_ID], "aid": ["6383"]},
+        )
+        self.assertEqual(request.headers["origin"], "https://open.douyin.com")
+        self.assertEqual(request.headers["referer"], "https://open.douyin.com/")
+        self.assertNotIn("cookie", request.headers)
+
+    async def test_argus_block_falls_through_to_the_next_aid(self) -> None:
+        aids: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            aid = parse_qs(request.url.query.decode("ascii"))["aid"][0]
+            aids.append(aid)
+            if aid == "6383":
+                return httpx.Response(403, text="Blocked by ArgusSecurityPlugin Uifid Not Found")
+            return httpx.Response(200, json={"status_code": 0, "aweme_detail": self._detail()})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with self.assertLogs(douyin_parser.logger, "WARNING") as logs:
+                detail = await douyin_parser._fetch_aweme_detail(client, self.VIDEO_ID)
+
+        self.assertEqual(detail["aweme_id"], self.VIDEO_ID)
+        self.assertEqual(aids, ["6383", "1128"])
+        self.assertIn("Uifid Not Found", logs.output[0])
 
 
 class PublishTimeTests(unittest.TestCase):
@@ -314,12 +321,6 @@ class DouyinAlbumDownloadTests(unittest.IsolatedAsyncioTestCase):
                 )
             if request.url.host == "www.iesdouyin.com":
                 return httpx.Response(200, text="<html><body>no router data</body></html>")
-            if request.url.host == "ttwid.bytedance.com":
-                return httpx.Response(
-                    200,
-                    json={"status_code": 0},
-                    headers={"set-cookie": "ttwid=test-visitor; Path=/; HttpOnly"},
-                )
             if request.url.host == "www.douyin.com":
                 return httpx.Response(200, json={"status_code": 0, "aweme_detail": detail})
             for prefix, response in image_responses.items():
@@ -473,10 +474,6 @@ class DouyinPublicMediaUrlTests(unittest.IsolatedAsyncioTestCase):
                 )
             if request.url.host == "www.iesdouyin.com":
                 return httpx.Response(200, text="<html>no router data</html>")
-            if request.url.host == "ttwid.bytedance.com":
-                return httpx.Response(
-                    200, json={"status_code": 0}, headers={"set-cookie": "ttwid=t; Path=/"}
-                )
             if request.url.host == "www.douyin.com" and request.url.path == "/aweme/v1/play/":
                 if not play_api_works:
                     return httpx.Response(403)
