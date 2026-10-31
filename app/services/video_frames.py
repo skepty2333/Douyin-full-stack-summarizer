@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 FRAME_ID_RE = re.compile(r"^V(?:0{3}[1-9]|0{2}[1-9]\d|0[1-9]\d{2}|[1-9]\d{3})$")
 FRAME_MARKER_RE = re.compile(r"\[\[VIDEO_FRAME:(V\d{4})\]\]")
 ANY_FRAME_MARKER_RE = re.compile(r"\[\[VIDEO_FRAME:[^\]\r\n]{0,80}\]\]")
+# Some models write the candidate id as a Markdown image target instead.
+MARKDOWN_FRAME_IMAGE_RE = re.compile(r"!\[[^\]\r\n]*\]\(\s*(V\d{4})\s*\)")
 VIDEO_CODE_RE = re.compile(r"^[A-Za-z0-9]{1,32}$")
 PERSISTED_ASSET_PATH_RE = re.compile(
     r"^blobs/[0-9a-f]{2}/[0-9a-f]{64}\.jpg$"
@@ -427,6 +429,19 @@ def persist_video_frame_markers_for_storage(
     rendered = ANY_FRAME_MARKER_RE.sub("", rendered)
     rendered = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", rendered)
     return rendered, tuple(persisted)
+
+
+def normalize_frame_marker_syntax(markdown_text: str) -> str:
+    """Rewrite ``![caption](V0001)`` into the canonical ``[[VIDEO_FRAME:V0001]]``.
+
+    Only the model-facing marker is rendered and persisted, so an image written
+    with the candidate id as its target would otherwise be stored as a broken
+    relative link.  The caption comes from the extracted frame itself.
+    """
+
+    if not isinstance(markdown_text, str) or not markdown_text:
+        return markdown_text
+    return MARKDOWN_FRAME_IMAGE_RE.sub(r"[[VIDEO_FRAME:\1]]", markdown_text)
 
 
 def strip_video_frame_markers_for_storage(markdown_text: str) -> str:

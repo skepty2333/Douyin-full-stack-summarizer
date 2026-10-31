@@ -502,6 +502,16 @@ class Stage3WritingPromptTests(unittest.TestCase):
         self.assertIn("伪列表段", prompt)
         self.assertIn("少而完整的论证段", prompt)
 
+    def test_video_evidence_outranks_a_stale_research_memo(self) -> None:
+        stage2 = ai_summarizer.STAGE2_SYSTEM
+        self.assertIn("否定性结论的限度", stage2)
+        self.assertIn("截至某日期未发现", stage2)
+        self.assertIn("一律归重要未决", stage2)
+        stage3 = ai_summarizer.STAGE3_SYSTEM
+        self.assertIn("以视频为准", stage3)
+        self.assertIn("不得被备忘中的“重大纠错”推翻", stage3)
+        self.assertIn("只说明证据不足", stage3)
+
     def test_screenshot_prompts_require_set_level_deduplication(self) -> None:
         self.assertIn("全局去重", ai_summarizer.SCREENSHOT_REVIEW_SYSTEM)
         self.assertIn("最小非重复视觉证据集合", ai_summarizer.SCREENSHOT_REVIEW_SYSTEM)
@@ -767,6 +777,30 @@ class StageInputContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             content[2]["image_url"]["url"].startswith("data:image/jpeg;base64,")
         )
+
+    async def test_stage3_rewrites_markdown_image_frame_references_to_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "video_frame_V0001.jpg"
+            Image.new("RGB", (40, 40), "white").save(path, "JPEG")
+            frame = ExtractedVideoFrame(
+                "V0001", 500, path, "visible_fact", "high", "关键姿态", 8.0
+            )
+            with patch.object(
+                ai_summarizer.aliyun_client,
+                "chat",
+                new_callable=AsyncMock,
+                side_effect=[
+                    RuntimeError("multimodal unavailable"),
+                    "正文\n\n![金币堆叠](V0001)\n*图注*",
+                ],
+            ):
+                result = await ai_summarizer.stage3_enrich_and_finalize(
+                    "完整增强逐字稿",
+                    "<internal_research_memo>无</internal_research_memo>",
+                    video_frames=(frame,),
+                )
+
+        self.assertEqual(result, "正文\n\n[[VIDEO_FRAME:V0001]]\n*图注*")
 
     async def test_stage3_retries_with_text_if_frame_input_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

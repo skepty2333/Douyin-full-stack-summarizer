@@ -402,6 +402,58 @@ class MarkerRenderingTests(unittest.TestCase):
         self.assertEqual(assets, ())
 
 
+class MarkerSyntaxNormalizationTests(unittest.TestCase):
+    def test_markdown_image_with_candidate_id_becomes_canonical_marker(self) -> None:
+        text = "正文\n\n![金币堆叠与量化指标](V0001)\n*图注*\n\n![](V0004)"
+        normalized = video_frames.normalize_frame_marker_syntax(text)
+
+        self.assertEqual(
+            normalized,
+            "正文\n\n[[VIDEO_FRAME:V0001]]\n*图注*\n\n[[VIDEO_FRAME:V0004]]",
+        )
+        self.assertEqual(
+            video_frames.FRAME_MARKER_RE.findall(normalized), ["V0001", "V0004"]
+        )
+
+    def test_other_images_canonical_markers_and_empty_input_are_untouched(self) -> None:
+        text = (
+            "![架构](https://example.com/a.png) ![x](V12) ![y](V00001)\n"
+            "[[VIDEO_FRAME:V0002]]\n`![z](V0003)`"
+        )
+        normalized = video_frames.normalize_frame_marker_syntax(text)
+
+        self.assertIn("![架构](https://example.com/a.png)", normalized)
+        self.assertIn("![x](V12)", normalized)
+        self.assertIn("![y](V00001)", normalized)
+        self.assertIn("[[VIDEO_FRAME:V0002]]", normalized)
+        self.assertEqual(video_frames.normalize_frame_marker_syntax(""), "")
+
+    def test_normalized_marker_is_persisted_as_a_real_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name).resolve()
+            path = root / "video_frame_V0001.jpg"
+            _save_test_jpeg(path)
+            frame = video_frames.ExtractedVideoFrame(
+                annotation_id="V0001",
+                timestamp_ms=1000,
+                path=path,
+                kind="ui_structure",
+                confidence="high",
+                caption="关键界面",
+                quality_score=10.0,
+            )
+            markdown, assets = video_frames.persist_video_frame_markers_for_storage(
+                video_frames.normalize_frame_marker_syntax("正文\n\n![图注](V0001)"),
+                {"V0001": frame},
+                video_code="A0001",
+                asset_root=root / "assets",
+            )
+
+        self.assertIn("knowledge-asset://A0001/V0001", markdown)
+        self.assertNotIn("](V0001)", markdown)
+        self.assertEqual(len(assets), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 
